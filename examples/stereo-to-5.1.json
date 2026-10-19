@@ -1,0 +1,78 @@
+{
+  "input_channels": [
+    "L",
+    "R"
+  ],
+  "output_channels": [
+    "L",
+    "R",
+    "C",
+    "SUB",
+    "RL",
+    "RR"
+  ],
+  "matrix": [
+    [
+      1,
+      0,
+      0,
+      0.5,
+      0.5,
+      0
+    ],
+    [
+      0,
+      1,
+      0,
+      0.5,
+      0,
+      0.5
+    ]
+  ],
+  "eqs": [
+    {
+      "name": "sub lp",
+      "channels": [
+        "SUB"
+      ],
+      "filters": [
+        {
+          "kind": "low_pass",
+          "fc_hz": 500,
+          "q": 0.7071
+        }
+      ]
+    },
+    {
+      "name": "rr hs 6dB",
+      "channels": [
+        "RR"
+      ],
+      "filters": [
+        {
+          "kind": "high_shelf1",
+          "fc_hz": 200,
+          "gain_db": -6
+        }
+      ]
+    },
+    {
+      "name": "shared pk",
+      "channels": [
+        "L",
+        "RL"
+      ],
+      "preamp_db": -1,
+      "filters": [
+        {
+          "kind": "peaking",
+          "fc_hz": 1000,
+          "gain_db": 4,
+          "q": 2
+        }
+      ]
+    }
+  ],
+  "master_gain_db": -2,
+  "limiter": true
+}

@@ -1,0 +1,25 @@
+[package]
+name = "linapo-gui"
+description = "Graphical editor for linapo: channel matrix, per-channel EQ, master gain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "linapo_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "linapo-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "x11", "wayland"] }
+egui_plot = "0.34.1"
+linapo-core = { path = "../linapo-core" }
+linapo-pw = { path = "../linapo-pw" }
+anyhow = "1"
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+
+[dev-dependencies]
+egui_kittest = "0.33.3"

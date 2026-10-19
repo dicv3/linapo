@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LinAPO
+GenericName=System equalizer
+Comment=Channel matrix and per-channel equalizer for PipeWire
+Exec=linapo-gui
+Icon=audio-card
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=equalizer;eq;audio;pipewire;apo;

@@ -1,0 +1,11 @@
+# Sample profile in Equalizer APO / AutoEQ format
+Preamp: -6.0 dB
+Filter 1: ON LSC Fc 105 Hz Gain 5.5 dB Q 0.70
+Filter 2: ON PK Fc 1000 Hz Gain 3.0 dB Q 1.41
+Filter 3: ON PK Fc 3500 Hz Gain -2.5 dB Q 2.0
+Filter 4: ON HSC Fc 10000 Hz Gain -3.0 dB Q 0.70
+
+# Per-channel example: only affects the left channel
+Channel: L
+Filter 5: ON PK Fc 250 Hz Gain -1.5 dB Q 3.0
+Channel: all

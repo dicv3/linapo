@@ -1,0 +1,11 @@
+[package]
+name = "linapo-pw"
+description = "PipeWire plumbing for linapo: install, live updates, status, device list"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+linapo-core = { path = "../linapo-core" }
+anyhow = "1"
+serde_json = "1"

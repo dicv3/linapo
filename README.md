@@ -1,228 +1,269 @@
-# linapo
+# LinAPO
 
-Equalizer APO + Peace for Linux (PipeWire): a **channel matrix**, **per-channel EQs**,
-a **master gain**, and **Equalizer APO profile import**.
+Equalizer APO-style channel routing and equalization for Linux audio systems using
+[PipeWire](https://pipewire.org/).
 
+LinAPO gives you a graphical editor and a command-line interface for building audio
+setups with:
+
+- An arbitrary input-to-output channel matrix
+- Per-output-channel EQ chains
+- Master gain and EQ bypass for A/B comparison
+- Stereo, quad, 5.1, 7.1, and custom channel layouts
+- Import of Equalizer APO profiles, including `Copy:`, `Channel:`, and `GraphicEQ:`
+- Live changes without restarting PipeWire when the graph structure is unchanged
+- Offline WAV rendering and frequency-response inspection
+
+```text
+inputs -> channel matrix -> per-output EQ -> master gain -> outputs
 ```
-inputs ──► matrix (N×M gains) ──► EQ per output channel ──► master gain ──► outputs
+
+## Screenshots
+
+| Matrix | Equalizer |
+| --- | --- |
+| ![LinAPO channel matrix](docs/matrix.png) | ![LinAPO equalizer editor](docs/equalizer.png) |
+
+| Setup | GraphicEQ import |
+| --- | --- |
+| ![LinAPO setup page](docs/setup.png) | ![GraphicEQ fit](docs/graphic-eq.png) |
+
+## Requirements
+
+- Linux
+- Rust and Cargo
+- PipeWire and WirePlumber for live audio
+- `xdg-desktop-portal` and a desktop portal backend for native file dialogs
+
+The core library and offline processing commands do not require a running PipeWire
+instance. The PipeWire integration uses the command-line tools `pw-dump`, `pw-cli`,
+and `systemctl`; no native PipeWire development library is required.
+
+## Install
+
+Clone the repository and build the release binaries:
+
+```sh
+git clone https://github.com/<your-user>/linapo.git
+cd linapo
+cargo build --release
 ```
 
-| Milestone | Status |
-|---|---|
-| 1. Biquad math + APO parser | done |
-| 2. CLI → PipeWire virtual sink | done |
-| 3. Channel matrix, per-channel EQ assignment, master gain, 5.1/7.1, live edits | done |
-| 4. GUI (`linapo-gui`) | done (this release) |
+The binaries are written to `target/release/linapo` and
+`target/release/linapo-gui`. You can also run them directly with Cargo:
+
+```sh
+cargo run --release -p linapo-gui
+cargo run --release -p linapo-cli -- --help
+```
 
 ## Quick start
 
+Import an Equalizer APO profile into a LinAPO setup:
+
 ```sh
-cargo test --workspace                                  # 188 tests, no PipeWire needed
-cargo build --release                                   # target/release/linapo  and  linapo-gui
+linapo setup import examples/sample.txt -o setup.json
+linapo info setup.json
+```
 
-linapo-gui                                              # the graphical editor (see below)
+Install it as a PipeWire virtual sink:
 
-linapo setup import examples/sample.txt -o my.json      # APO profile -> setup file
-linapo info my.json                                     # matrix, EQs, channels
-linapo install my.json                                  # virtual sink + restart PipeWire
-linapo live master my.json -6                           # change master gain, no restart
-linapo live route my.json L SUB -3                      # change one matrix cell, no restart
-linapo live apply my.json                               # push every value of an edited my.json
+```sh
+linapo install setup.json
+```
+
+Select **LinAPO EQ** as the output device in your desktop sound settings, or set it
+as the default with `wpctl`. Audio then flows through LinAPO before reaching the
+selected output device. To target a specific PipeWire sink:
+
+```sh
+linapo install setup.json --target <pipewire-node-name>
+```
+
+Installation restarts PipeWire, WirePlumber, and PipeWire Pulse, briefly interrupting
+audio. Use `--no-restart` when you only want to generate the configuration.
+
+Change values in a running setup without restarting PipeWire:
+
+```sh
+linapo live master setup.json -6
+linapo live route setup.json L SUB -3
+linapo live bypass setup.json on
+linapo live apply setup.json
+```
+
+Remove the virtual sink with:
+
+```sh
 linapo uninstall
 ```
 
-After `install`, choose **LinAPO EQ** as the output device in your sound settings (or
-`wpctl set-default`). Audio goes: apps → LinAPO EQ → your default output. Use
-`--target <node.name>` to send it to a specific device.
-`install` restarts `pipewire`, `wireplumber` and `pipewire-pulse`, which briefly interrupts
-audio; use `--no-restart` to skip.
+## GUI
 
-Other commands: `linapo process setup.json in.wav out.wav` (render a WAV offline through the
-full engine), `linapo response setup.json -c L` (frequency response CSV),
-`linapo gen-config` (print the PipeWire config), `linapo setup new --layout stereo --out-layout 5.1`.
-Every command that takes a setup also accepts an Equalizer APO `.txt` directly (`--layout 5.1`).
-
-## The GUI
+Launch the graphical editor with:
 
 ```sh
-cargo run --release -p linapo-gui          # or: linapo-gui [path/to/setup.json]
+linapo-gui
+# or open a setup directly
+linapo-gui setup.json
 ```
 
-The setup lives in `~/.config/linapo/setup.json` and is saved automatically; every edit is
-pushed to PipeWire within about 60 ms, with no restart. Drop an Equalizer APO `.txt` (or a setup
-`.json`) on the window to import it. `packaging/linapo.desktop` is a starter menu entry.
+The default setup is saved at `~/.config/linapo/setup.json`. Edits are saved
+automatically and pushed to PipeWire after a short debounce period.
 
-**Matrix**: click a cell to connect or disconnect, drag it up and down to change the volume,
-scroll for ±0.5 dB, right-click for an exact value and polarity inversion. The `n filters`
-button under each output jumps to that output's equalizer. Presets: straight through, downmix to
-stereo, clear.
+### Matrix
 
-![matrix](docs/matrix.png)
+The matrix editor controls the linear gain from every input channel to every output
+channel. Click a cell to connect or disconnect a route, drag to adjust its gain, and
+right-click for an exact value or polarity inversion. Presets include pass-through,
+stereo downmix, and clear.
 
-**Equalizer**: a list of EQs on the left (enable, duplicate, delete, import APO profiles); for
-the selected EQ a response plot with one draggable dot per filter, plus name, preamp, the output
-channels it applies to, and a table of filters. Drag a dot to change frequency and gain, scroll
-over it to change Q, double-click empty space to add a filter. The white curve is the combined
-response of every EQ on the output channel you choose; the teal one is the selected EQ alone.
+### Equalizer
 
-![equalizer](docs/equalizer.png)
+Create, duplicate, delete, enable, and disable named EQ presets. An EQ can apply to
+multiple output channels, while multiple EQs can be stacked on one channel. The
+response plot supports draggable frequency/gain handles, mouse-wheel Q adjustment,
+and double-click insertion of new filters.
 
-**Setup**: input and output channel layouts (existing routes between channels that stay are
-kept), the output device, APO import (as new EQs, or replace everything including `Copy:`
-lines), and install / remove.
+### Setup
 
-![setup](docs/setup.png)
+Choose input and output layouts, select the destination device, install or remove the
+PipeWire graph, and import APO profiles either as additional EQs or as a complete
+replacement. Undo and redo cover edits, imports, and layout changes.
 
-**Files**: *Browse...* (import an APO profile), *Browse and replace...*, *Open...* and *Save a copy...*
-open native file dialogs that remember the last folder; dropping a file on the window still works.
-**Delete** removes the selected filter.
+Structural changes such as channel layouts, output devices, and filter types require
+an install or PipeWire restart. Numeric changes, filter enable state, and EQ bypass
+are live.
 
-**Top bar**: *Undo* / *Redo* (Ctrl+Z, Ctrl+Shift+Z; a whole drag is one step, and every edit
-is undoable, including imports and layout changes), *Bypass EQ* for A/B comparison with the
-original sound, and the master gain. Each filter has an *On* checkbox; disabled filters are
-grey dots on the plot and drop out of the curve. A status pill (top right) shows whether the audio engine is **Live**, **Not installed**, **Not
-running** or needs a **restart**. Changing channels, the output device, or the number/type of
-filters is structural: a banner offers "Apply and restart audio" (which restarts PipeWire and
-briefly interrupts sound). Everything else is live.
+## CLI commands
 
-Built with egui/eframe: pure Rust, no GTK or Qt needed. PipeWire work runs on a background
-thread, so the window never blocks, and bursts of edits are coalesced.
+```text
+linapo info <setup-or-apo-file>
+linapo response <setup-or-apo-file> -c L
+linapo process <setup-or-apo-file> in.wav out.wav
+linapo setup new --layout stereo --out-layout 5.1 -o setup.json
+linapo setup import profile.txt --layout stereo -o setup.json
+linapo gen-config <setup-or-apo-file>
+linapo install <setup-or-apo-file>
+linapo uninstall
+linapo live apply <setup.json>
+linapo live master <setup.json> <db>
+linapo live route <setup.json> <input> <output> <db|off>
+linapo live bypass <setup.json> <on|off>
+```
 
-## The setup file
+Commands that accept a setup also accept an Equalizer APO profile. Use `--layout`
+when loading an APO profile; JSON setup files contain their own layouts.
+
+`process` renders a 32-bit float WAV through the reference engine, including the
+matrix, EQ, master gain, and limiter. `response` prints CSV frequency-response data.
+
+## Setup files
+
+Setup files are JSON. The matrix is indexed as `[input][output]` and stores linear
+gains: `1` is unity, `0.5` is approximately -6 dB, and negative values invert
+polarity.
 
 ```json
 {
-  "input_channels":  ["L", "R"],
+  "input_channels": ["L", "R"],
   "output_channels": ["L", "R", "C", "SUB", "RL", "RR"],
-  "matrix": [[1,0,0,0.5,0.5,0],
-             [0,1,0,0.5,0,0.5]],
+  "matrix": [
+    [1, 0, 0, 0.5, 0.5, 0],
+    [0, 1, 0, 0.5, 0, 0.5]
+  ],
   "eqs": [
-    { "name": "sub lp", "channels": ["SUB"],
-      "filters": [{ "kind": "low_pass", "fc_hz": 500, "q": 0.7071 }] },
-    { "name": "shared", "channels": ["L", "RL"], "preamp_db": -1,
-      "filters": [{ "kind": "peaking", "fc_hz": 1000, "gain_db": 4, "q": 2 }] }
+    {
+      "name": "sub low-pass",
+      "channels": ["SUB"],
+      "filters": [
+        {"kind": "low_pass", "fc_hz": 500, "q": 0.7071}
+      ]
+    }
   ],
   "master_gain_db": -2,
   "limiter": true
 }
 ```
 
-* **matrix** is `[input][output]` in *linear* gain: `0` = not routed, `1` = unity, `0.5` ≈ -6 dB,
-  negative = polarity inversion. Any input can feed any output at any volume.
-* **eqs**: each has a channel list (*output* channels). One EQ can serve many channels; a channel can
-  have several EQs, which stack. `enabled: false` switches one off.
-* Each filter has `"enabled": true/false` (a disabled filter keeps its settings and does nothing),
-  and the setup has `"bypass_eq": true` to switch every EQ off at once for A/B comparison.
-* Filter kinds: `peaking`, `low_shelf`, `high_shelf`, `low_shelf1`, `high_shelf1` (6 dB/oct),
-  `low_pass`, `high_pass`, `band_pass`, `notch`, `all_pass`. `q` defaults to 0.7071.
-* Channel names: `L R C SUB RL RR SL SR` (aliases FL FR FC LFE BL BR) and `CH1`, `CH2`...
+Supported filter kinds are `peaking`, `low_shelf`, `high_shelf`, `low_shelf1`,
+`high_shelf1`, `low_pass`, `high_pass`, `band_pass`, `notch`, and `all_pass`.
+Channel names include `L`, `R`, `C`, `SUB`, `RL`, `RR`, `SL`, `SR`, and numbered
+channels such as `CH1` and `CH2`. Common APO aliases such as `FL`, `FR`, `FC`,
+`LFE`, `BL`, and `BR` are accepted.
 
 ## Equalizer APO import
 
-`Preamp`, `Filter` (PK, LP/LPQ, HP/HPQ, BP, NO, AP, LS/LSC/LSQ, HS/HSC/HSQ, `LS 6dB` / `LS 12dB`,
-`BW Oct`), `Channel:` (becomes EQ-to-channel assignment), `Copy:` (becomes the matrix, including
-`0.5*L+0.5*R`, `-6dB*C`, simultaneous `Copy: L=R R=L`), `GraphicEQ:` (see below) and `Include:`.
-`Device:`, `Delay:`, `Convolution:`, `If/Else`, VST/LADSPA warn and are ignored.
+LinAPO understands the following APO constructs:
 
-### GraphicEQ
+- `Preamp`
+- `Filter` types including peaking, shelves, pass, notch, and all-pass filters
+- `Channel:` assignments
+- `Copy:` routing and gain expressions
+- `GraphicEQ:` curves
+- `Include:` files when parsing from disk
 
-Equalizer APO turns a `GraphicEQ:` line (many `frequency gain` points, as exported by AutoEq) into
-a linear-phase FIR filter. linapo instead **fits a bank of ordinary filters** to the same curve (a
-low shelf, peaking filters, a high shelf, plus a preamp), using least squares on the log-frequency
-interpolation APO documents (linear in dB against log frequency, flat beyond the end points):
+`GraphicEQ:` curves are fitted to ordinary biquad filters rather than imported as
+linear-phase FIR filters. This keeps the result latency-free, editable, switchable,
+and usable with live PipeWire controls. The fit reports its maximum and RMS magnitude
+error. The approximation changes phase and may be less accurate around very sharp
+features.
 
-* No latency (an FIR would delay the sound by tens of milliseconds, which hurts lip-sync in video).
-* They are normal filters: editable, switchable, live, and one `Channel:` section scopes them.
-* It is a magnitude approximation, and the phase differs from APO's linear-phase FIR. The import
-  tries 3, 4, 6, then 8 bands per octave and keeps the smallest bank within 0.5 dB; the result and
-  its maximum error are shown on import. A smooth 127-point headphone-style curve became **31
-  filters with a 0.26 dB maximum error**. Very sharp features (narrower than about a third of an
-  octave) can exceed that, and the message will say so.
-* I read APO's "flat outside the specified bands" as holding the end values. If APO actually
-  returns to 0 dB there, results differ only beyond the first/last point (AutoEq's cover 20 Hz-20 kHz).
+Unsupported APO features such as `Device:`, `Delay:`, `Convolution:`, conditional
+blocks, VST, and LADSPA lines are reported as warnings and skipped.
 
-![graphic eq](docs/graphic-eq.png)
-Files may be UTF-8 (BOM ok) or UTF-16; bad lines become warnings.
+## Architecture
 
-## Live editing
+```text
+linapo-core  DSP, biquads, APO parser, setup model, engine, PipeWire config generation
+linapo-pw    PipeWire discovery, installation, status, and live control updates
+linapo-cli   Command-line interface and offline processing commands
+linapo-gui   egui/eframe editor and background PipeWire worker
+```
 
-Everything numeric changes instantly while audio plays: matrix cells, preamps, master gain, and
-the frequency / Q / gain of **every** filter type, plus switching a single filter or the whole EQ
-on and off (`linapo live apply`, `master`, `route`, `bypass on|off`; the GUI does this for every
-edit). Only the *structure* needs `linapo install`: channel layout, output device, and the number
-or type of filters. `live apply` tells you when that is the case.
+PipeWire's `filter-chain` module runs the live DSP graph. Native PipeWire nodes are
+used where possible; filters needing exact cookbook coefficients are emitted as
+`bq_raw` nodes. The core crate also contains a reference engine used by offline
+processing and backend tests.
 
-Under the hood, peaking and shelf filters use PipeWire's native nodes; every other kind is a
-`bq_raw` node whose coefficients are computed here and pushed at the graph's running sample rate
-(read from PipeWire's `settings` metadata). A disabled filter stays in the graph with neutral
-values, which is why toggling never needs a restart. After each live edit the installed config
-file is refreshed too, so a PipeWire restart starts from your current values.
+## Testing
 
-## How it works, and what I verified
+Run the Rust test suite with:
 
-PipeWire's own `filter-chain` module runs the DSP (nodes: `copy`, `mixer`, `linear`, `bq_*`).
-`linapo-core` also contains a complete reference engine (`engine.rs`) with smoothed matrix/gain
-ramps, per-channel EQ state and a peak limiter; it powers `linapo process` and is the oracle the
-PipeWire backend is tested against.
+```sh
+cargo test --workspace
+```
 
-I ran everything against a real **PipeWire 1.0.5 + WirePlumber** (headless, null output):
+The end-to-end PipeWire parity test starts a private headless PipeWire instance, so
+it does not change the user's normal audio session:
 
-* An imported 127-point GraphicEQ (31 biquads per channel) matched the engine to **0.005 dB**, so
-  PipeWire's float32 biquad cascade is not a precision problem at that size.
-* All 10 filter types, a stereo→5.1 upmix, per-route volumes, shared EQs and master gain match
-  the engine to **0.000 dB** at every tone on every channel.
-* Live edits made mid-playback landed within ~100 ms and matched the engine afterwards.
-* `tests/pipewire/parity.py SETUP.json` repeats this on your machine with a *private* PipeWire
-  (needs pipewire, wireplumber, pw-cat, dbus-run-session, numpy).
-* The GUI was driven end to end: real mouse clicks (xdotool, under Xvfb) on the real binary, against
-  a private PipeWire, while a tone played. Connecting a matrix cell moved a tone between channels
-  within ~100 ms, and a slider drag reached exactly the saved dB value in the recorded audio
-  (`tests/pipewire/gui_e2e/`; its click coordinates are calibrated to the default window size).
+```sh
+python3 tests/pipewire/parity.py examples/stereo-to-5.1.json
+```
 
-Things testing turned up, now handled:
-
-* PipeWire 1.0.5's native `bq_lowpass`/`bq_highpass` do not treat Q like the RBJ cookbook
-  (requested 0.7071 behaved like 0.90). They (and band-pass, notch, all-pass, 6 dB shelves) are
-  emitted as `bq_raw` with exact coefficients instead: per sample rate in the config, and as live
-  controls for the running rate. Verified by editing their parameters, disabling filters and
-  switching bypass on during playback: output matched the engine to within 0.03 dB.
-* `pw-cli set-param` silently drops a batch larger than ~1 KB, so `live` sends small chunks and
-  checks that PipeWire echoed every key.
+The parity test additionally needs PipeWire, WirePlumber, `pw-cat`, `pw-cli`,
+`dbus-run-session`, Python 3, and NumPy. GUI end-to-end tests live in
+`tests/pipewire/gui_e2e/`.
 
 ## Limitations
 
-* Tested on PipeWire 1.0.5 only. Newer versions should behave the same; if not, run
-  `tests/pipewire/parity.py`.
-* The **limiter** exists only in the reference engine; the PipeWire backend ignores it (with a
-  warning). Keep preamps conservative.
-* At most **8 input channels** (the builtin mixer has 8 inputs).
-* EQ always runs after the matrix; APO processes lines in file order, so profiles that filter
-  *before* a `Copy:` can differ.
-* `LSC x dB` slope forms and `LS 12dB` are close approximations of APO's definitions. I could
-  not run Equalizer APO to compare.
-* Changing a gain jumps rather than ramps on the PipeWire backend (the reference engine ramps).
-* If your PipeWire switches sample rate at runtime (several `clock.allowed-rates`), live edits of
-  the raw-coefficient filters are computed for the rate PipeWire reports by default; a mismatch
-  corrects itself at the next change of that filter's structure or after a restart.
-* File dialogs (Browse, Open, Save a copy) use the desktop's XDG portal, so they need
-  `xdg-desktop-portal` plus a backend (GNOME, KDE, GTK... all ship one). Without one the app says so
-  and you can paste a path or drop the file on the window instead. I saw the real GTK chooser open
-  from the app; I did not test KDE's. The layout pickers offer mono, stereo, quad, 5.1 and 7.1; arbitrary channel
-  lists work in the setup file but are not editable in the GUI.
-* Not covered: a real `pw_filter` engine. `pipewire-rs` (0.8/0.9) has no filter bindings, and
-  `filter-chain` already provides the virtual sink, linking and format handling.
+- The PipeWire backend has been tested against PipeWire 1.0.5; run the parity test
+  when validating another version.
+- The limiter is implemented by the reference engine but is not currently applied by
+  the PipeWire backend.
+- The built-in PipeWire mixer supports at most eight input channels.
+- EQ is applied after the matrix, so profiles that filter before a `Copy:` operation
+  can produce different results from Equalizer APO.
+- PipeWire gain changes currently jump instead of using the reference engine's smooth
+  ramps.
+- Arbitrary channel lists work in JSON setup files but the GUI layout picker offers
+  mono, stereo, quad, 5.1, and 7.1.
 
-## Layout
+## License
 
-```
-crates/linapo-core/   biquad.rs filter.rs apo.rs matrix.rs setup.rs chain.rs engine.rs handoff.rs pipewire_conf.rs
-crates/linapo-pw/     PipeWire plumbing shared by CLI and GUI: install, live apply, status, device list
-crates/linapo-cli/    the `linapo` binary + tests/cli.rs
-crates/linapo-gui/    the egui app: model.rs (edit logic), plot_math.rs, backend.rs (worker), app.rs (UI), ui_tests.rs
-tests/pipewire/       parity.py (audio parity), gui_e2e/ (GUI against a private PipeWire)
-examples/             sample.txt (APO profile), stereo-to-5.1.json (setup)
-packaging/            linapo.desktop
-docs/                 screenshots
-```
-`handoff.rs` is a lock-free hand-over for swapping in a new engine on a real-time thread,
-for a future custom node or GUI engine.
+LinAPO is dual-licensed under either of:
+
+- [MIT License](https://opensource.org/licenses/MIT)
+- [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+
+at your option.

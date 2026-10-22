@@ -8,7 +8,9 @@ use eframe::egui;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
 use linapo_core::apo::layout_for;
+use linapo_core::profiles::Workspace;
 use linapo_core::{Channel, Setup};
+use linapo_pw::WatchLock;
 
 use crate::app::{App, Config, Tab};
 use crate::backend::fake::Fake;
@@ -27,7 +29,17 @@ fn tmpdir(name: &str) -> PathBuf {
 }
 
 fn fast() -> Config {
-    Config { debounce_apply: Duration::ZERO, debounce_save: Duration::ZERO, history_gap: Duration::ZERO }
+    // Each test gets its own automatic-switching lock, so tests can run in parallel.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Config {
+        debounce_apply: Duration::ZERO,
+        debounce_save: Duration::ZERO,
+        history_gap: Duration::ZERO,
+        poll_interval: Duration::from_millis(10),
+        repaint_while_idle: false,
+        watch_lock_path: Some(std::env::temp_dir().join(format!("linapo-guitest-lock-{}-{n}", std::process::id()))),
+    }
 }
 
 fn harness(setup: Setup, path: Option<PathBuf>, fake: &Fake) -> Harness<'static, App> {
@@ -700,4 +712,315 @@ fn delete_key_removes_the_selected_filter() {
     h.get_by_label("Undo").click();
     settle(&mut h);
     assert_eq!(h.state().setup.eqs[0].filters.len(), 3, "and it is undoable");
+}
+
+// ---------------------------------------------------------------- profiles
+
+fn ws_root(name: &str) -> PathBuf {
+    tmpdir(name)
+}
+
+fn with_gain(g: f64) -> Setup {
+    let mut s = stereo();
+    s.master_gain_db = g;
+    s
+}
+
+/// A workspace with profiles Default (0 dB) and Cans (-5 dB); the app starts on Default.
+fn ws_harness(root: &Path, fake: &Fake, cfg: Config) -> Harness<'static, App> {
+    let ws = Workspace::open(root).unwrap();
+    ws.store.save("Cans", &with_gain(-5.0)).unwrap();
+    let setup = ws.load_active().unwrap();
+    let app = App::new(setup, None, fake.clone(), || {}, cfg).with_workspace(ws);
+    Harness::builder().with_size(egui::vec2(1100.0, 760.0)).build_state(|ctx, app: &mut App| app.ui(ctx), app)
+}
+
+fn dev(name: &str) -> Option<crate::backend::Sink> {
+    Some(crate::backend::Sink { node_name: name.into(), description: format!("{name} (device)") })
+}
+
+#[test]
+fn switching_profiles_loads_it_keeps_both_files_and_resets_undo() {
+    let root = ws_root("sw");
+    let fake = Fake::new();
+    let mut h = ws_harness(&root, &fake, fast());
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Default");
+    assert_eq!(h.state().profile_names(), ["Cans", "Default"]);
+
+    // edit Default, then switch: the edit must be saved into Default, and Cans loaded
+    h.get_by_label("route L to R: off").click();
+    settle(&mut h);
+    assert!(h.state().can_undo());
+    h.state_mut().switch_profile("Cans");
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Cans");
+    assert_eq!(h.state().setup.master_gain_db, -5.0);
+    assert_eq!(h.state().setup.matrix.get(0, 1), 0.0, "Cans has its own matrix");
+    assert!(!h.state().can_undo(), "undo does not cross profiles");
+    assert!(fake.calls().iter().any(|c| c == "apply master=-5"), "the new profile is pushed live: {:?}", fake.calls());
+    let ws = Workspace::open(&root).unwrap();
+    assert_eq!(ws.active_name(), "Cans", "the choice is remembered");
+    assert_eq!(ws.store.load("Default").unwrap().matrix.get(0, 1), 1.0, "Default kept the edit");
+
+    // edits now go to Cans only
+    h.state_mut().setup.master_gain_db = -8.0;
+    h.state_mut().touch();
+    settle(&mut h);
+    assert_eq!(Workspace::open(&root).unwrap().store.load("Cans").unwrap().master_gain_db, -8.0);
+    assert_eq!(Workspace::open(&root).unwrap().store.load("Default").unwrap().master_gain_db, 0.0);
+    h.state_mut().switch_profile("Default");
+    settle(&mut h);
+    assert_eq!(h.state().setup.matrix.get(0, 1), 1.0);
+}
+
+#[test]
+fn the_profile_bar_has_a_combo_and_the_four_actions() {
+    let root = ws_root("bar");
+    let fake = Fake::new();
+    let mut h = ws_harness(&root, &fake, fast());
+    settle(&mut h);
+    for label in ["New profile", "Duplicate profile", "Rename profile", "Delete profile"] {
+        h.get_by_label(label);
+    }
+    let combos = h.get_all_by_role(egui::accesskit::Role::ComboBox).collect::<Vec<_>>();
+    assert!(!combos.is_empty());
+    // pick Cans through the real combo
+    combos[0].click();
+    h.run();
+    h.get_by_label("Cans").click();
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Cans");
+}
+
+#[test]
+fn creating_duplicating_renaming_and_deleting_through_the_dialogs() {
+    let root = ws_root("dialogs");
+    let fake = Fake::new();
+    let mut h = ws_harness(&root, &fake, fast());
+    settle(&mut h);
+
+    // New: empty profile with the same channels
+    h.get_by_label("New profile").click();
+    h.run();
+    assert!(matches!(h.state().profile_dialog, Some(crate::ProfileDialog::New(_))));
+    h.state_mut().profile_dialog = Some(crate::ProfileDialog::New("Room".into()));
+    h.run();
+    h.get_by_label("Create").click();
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Room");
+    assert!(h.state().profile_dialog.is_none());
+    assert!(h.state().setup.eqs.is_empty() && h.state().setup.master_gain_db == 0.0);
+
+    // Duplicate (of Cans, with its -5 dB)
+    h.state_mut().switch_profile("Cans");
+    settle(&mut h);
+    h.state_mut().profile_dialog = Some(crate::ProfileDialog::Duplicate("Cans quiet".into()));
+    h.run();
+    h.get_by_label("Duplicate").click();
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Cans quiet");
+    assert_eq!(h.state().setup.master_gain_db, -5.0);
+
+    // Rename keeps the file, bindings and active name consistent
+    h.state_mut().bind_device("usb", "Cans quiet");
+    h.state_mut().profile_dialog = Some(crate::ProfileDialog::Rename("Night".into()));
+    h.run();
+    h.get_by_label("Rename").click();
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Night");
+    assert_eq!(h.state().bindings(), [("usb".to_string(), "Night".to_string())]);
+    let ws = Workspace::open(&root).unwrap();
+    assert!(ws.store.exists("Night") && !ws.store.exists("Cans quiet"));
+
+    // Delete (with confirmation)
+    h.get_by_label("Delete profile").click();
+    h.run();
+    h.get_by_label("Delete the profile 'Night'? This cannot be undone.");
+    h.get_by_label("Delete").click();
+    settle(&mut h);
+    assert_ne!(h.state().active_profile(), "Night");
+    assert!(!Workspace::open(&root).unwrap().store.exists("Night"));
+    assert!(h.state().bindings().is_empty(), "its binding went with it");
+    // pending edits of a deleted profile must not bring its file back
+    h.run();
+    std::thread::sleep(Duration::from_millis(50));
+    h.run();
+    assert!(!Workspace::open(&root).unwrap().store.exists("Night"));
+}
+
+#[test]
+fn the_dialog_explains_bad_names_and_cannot_delete_the_last_profile() {
+    let root = ws_root("validation");
+    let fake = Fake::new();
+    let mut h = ws_harness(&root, &fake, fast());
+    settle(&mut h);
+    h.state_mut().profile_dialog = Some(crate::ProfileDialog::New("bad/name".into()));
+    h.run();
+    h.get_by_label("A profile name cannot contain '/'");
+    h.state_mut().profile_dialog = Some(crate::ProfileDialog::New("Cans".into()));
+    h.run();
+    h.get_by_label("A profile named 'Cans' already exists.");
+    h.state_mut().profile_dialog = Some(crate::ProfileDialog::New("".into()));
+    h.run();
+    h.get_by_label("Type a name.");
+    h.get_by_label("Cancel").click();
+    h.run();
+    assert!(h.state().profile_dialog.is_none());
+    assert_eq!(h.state().profile_names().len(), 2, "nothing was created");
+
+    // only one profile left -> delete is refused
+    h.state_mut().switch_profile("Cans");
+    settle(&mut h);
+    assert!(h.state_mut().delete_active_profile().is_ok());
+    assert_eq!(h.state().profile_names().len(), 1);
+    h.get_by_label("Delete profile").click();
+    h.run();
+    h.get_by_label("This is the only profile; create another one first.");
+    assert!(h.state_mut().delete_active_profile().is_err());
+}
+
+#[test]
+fn automatic_switching_follows_the_output_device() {
+    let root = ws_root("auto");
+    let fake = Fake::new();
+    let mut h = ws_harness(&root, &fake, fast());
+    settle(&mut h);
+    h.state_mut().bind_device("usb", "Cans");
+    h.state_mut().bind_device("hdmi", "Default");
+    // switching is off: a device change does nothing
+    *fake.device.lock().unwrap() = dev("usb");
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Default");
+    assert!(!h.state().switching_here());
+
+    h.state_mut().set_auto_switch(true);
+    settle(&mut h);
+    assert!(h.state().switching_here(), "this window took the lock");
+    assert_eq!(h.state().active_profile(), "Cans", "usb is bound to Cans");
+    assert_eq!(h.state().setup.master_gain_db, -5.0);
+    assert!(h.state().message_text().unwrap().contains("switched to profile 'Cans'"), "{:?}", h.state().message_text());
+    assert_eq!(h.state().current_device.as_ref().unwrap().node_name, "usb");
+
+    *fake.device.lock().unwrap() = dev("hdmi");
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Default");
+    // an unbound device with no default leaves the profile alone
+    *fake.device.lock().unwrap() = dev("bluetooth");
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Default");
+    // ...unless there is a default profile
+    h.state_mut().set_default_profile(Some("Cans"));
+    *fake.device.lock().unwrap() = dev("speaker");
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Cans");
+    h.get_by_label("Output: speaker (device)  (profile Cans)");
+}
+
+#[test]
+fn when_another_process_switches_this_window_stays_out_of_it() {
+    let root = ws_root("elsewhere");
+    let fake = Fake::new();
+    let cfg = fast();
+    let service = WatchLock::try_acquire_at(cfg.watch_lock_path.as_ref().unwrap()).expect("the 'service' takes the lock first");
+    let mut h = ws_harness(&root, &fake, cfg);
+    settle(&mut h);
+    h.state_mut().bind_device("usb", "Cans");
+    h.state_mut().set_auto_switch(true);
+    *fake.device.lock().unwrap() = dev("usb");
+    settle(&mut h);
+    assert!(!h.state().switching_here() && h.state().watch_elsewhere);
+    assert_eq!(h.state().active_profile(), "Default", "this window does not switch");
+
+    // the service switches (it writes the state file) and the window follows
+    let mut svc = Workspace::open(&root).unwrap();
+    svc.activate("Cans").unwrap();
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Cans");
+    assert_eq!(h.state().setup.master_gain_db, -5.0);
+    drop(service);
+}
+
+#[test]
+fn an_external_switch_waits_until_the_user_stops_editing() {
+    let root = ws_root("external");
+    let fake = Fake::new();
+    let cfg = Config { debounce_save: Duration::from_secs(60), debounce_apply: Duration::from_secs(60), ..fast() };
+    let mut h = ws_harness(&root, &fake, cfg);
+    settle(&mut h);
+    h.state_mut().setup.master_gain_db = -1.0;
+    h.state_mut().touch(); // unsaved edit in progress
+    let mut other = Workspace::open(&root).unwrap();
+    other.activate("Cans").unwrap();
+    settle(&mut h);
+    assert_eq!(h.state().active_profile(), "Default", "the edit in progress is not thrown away");
+    assert_eq!(h.state().setup.master_gain_db, -1.0);
+}
+
+#[test]
+fn bindings_editor_in_the_setup_tab() {
+    let root = ws_root("bindui");
+    let fake = Fake::new();
+    let mut h = ws_harness(&root, &fake, fast());
+    settle(&mut h);
+    *fake.device.lock().unwrap() = dev("usb");
+    settle(&mut h);
+    h.get_by_label("Setup").click();
+    h.run();
+    h.get_by_label("Switch profiles automatically when the output device changes");
+    h.get_by_label("Output device now: usb (device)");
+    h.get_by_label("Use this profile for this device").click();
+    h.run();
+    assert_eq!(h.state().bindings(), [("usb".to_string(), "Default".to_string())]);
+    h.run();
+    h.get_by_label("remove binding for usb").click();
+    h.run();
+    assert!(h.state().bindings().is_empty());
+
+    // the checkbox turns automatic switching on and shows who is in charge
+    h.get_by_label("Switch profiles automatically when the output device changes").click();
+    settle(&mut h);
+    assert!(h.state().auto_switch_enabled() && h.state().switching_here());
+    h.get_by_label("Handled by this window. To keep switching when it is closed, run `linapo autostart enable`.");
+}
+
+#[test]
+fn binding_without_a_known_device_explains_itself() {
+    let root = ws_root("nodevice");
+    let fake = Fake::new();
+    let mut h = ws_harness(&root, &fake, fast());
+    settle(&mut h);
+    h.state_mut().bind_current_device();
+    assert!(h.state().message_is_error());
+    assert!(h.state().bindings().is_empty());
+}
+
+#[test]
+fn in_profile_mode_open_and_save_a_copy_do_not_move_the_profile() {
+    let root = ws_root("files");
+    let other = root.join("elsewhere.json");
+    with_gain(-9.0).save(&other).unwrap();
+    let fake = Fake::new();
+    let picker = FakePicker::new(Some(other.clone()), Duration::from_millis(5));
+    let ws = Workspace::open(&root).unwrap();
+    ws.store.save("Cans", &with_gain(-5.0)).unwrap();
+    let setup = ws.load_active().unwrap();
+    let app = App::new(setup, None, fake.clone(), || {}, fast()).with_workspace(ws).with_picker(picker.clone());
+    let mut h = Harness::builder().with_size(egui::vec2(1100.0, 760.0)).build_state(|ctx, app: &mut App| app.ui(ctx), app);
+    settle(&mut h);
+    let profile_file = Workspace::open(&root).unwrap().store.path_of("Default");
+    h.get_by_label("Setup").click();
+    h.run();
+    h.get_by_label("Open\u{2026}").click();
+    settle(&mut h);
+    assert_eq!(h.state().setup.master_gain_db, -9.0, "the file's contents were loaded");
+    assert_eq!(h.state().path.as_deref(), Some(profile_file.as_path()), "into the active profile");
+    assert_eq!(h.state().active_profile(), "Default");
+
+    let copy = root.join("backup");
+    *picker.answer.lock().unwrap() = Some(copy);
+    h.get_by_label("Save a copy\u{2026}").click();
+    settle(&mut h);
+    assert_eq!(Setup::load(&root.join("backup.json")).unwrap().master_gain_db, -9.0);
+    assert_eq!(h.state().path.as_deref(), Some(profile_file.as_path()), "still editing the profile");
 }

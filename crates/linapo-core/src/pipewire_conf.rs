@@ -6,37 +6,45 @@
 //! capture ports -> in_<ch> (copy) --\
 //!                                    +--> mix_<out> (mixer, 1 gain per input)
 //! capture ports -> in_<ch> (copy) --/        -> pre_<out> (linear, EQ preamp)
-//!                                            -> eq_<out>_<n> (bq_*)...
+//!                                            -> eq_<out>_1 .. eq_<out>_<slots> (bq_raw)
 //!                                            -> master_<out> (linear) -> playback ports
 //! ```
 //!
-//! Every matrix cell, preamp, filter parameter and master gain is a control
-//! on a named node, so values can be changed live (see [`ControlKey`]) without
-//! restarting PipeWire. Changing the *structure* (channel layout, number or type of
-//! filters, first-order shelf settings) needs a regenerate + restart.
+//! # Fixed slots: switching profiles never restarts anything
 //!
-//! Peaking and shelf filters use PipeWire's native `bq_*` nodes (they match the RBJ cookbook
-//! exactly and have a Gain control that is neutral at 0 dB). Every other kind (low/high-pass,
-//! band-pass, notch, all-pass, 6 dB shelves) is a `bq_raw` node whose coefficients are computed
-//! here, because PipeWire 1.0.5's native low/high-pass treat Q differently (a requested 0.7071
-//! behaved like 0.90). Raw coefficients are live-editable too, for the rate the graph runs at.
-//! A disabled filter (or the setup-wide EQ bypass) stays in the graph with neutral values, so
-//! switching it on or off never needs a restart.
+//! Every output channel has the same number of filter *slots* (at least [`MIN_SLOTS`]). Every
+//! slot is a `bq_raw` node whose coefficients this crate computes (so every filter type matches
+//! the RBJ cookbook and the engine exactly, which PipeWire's native low/high-pass did not). Slots
+//! a profile does not use hold neutral coefficients, and so do disabled filters and the setup-wide
+//! EQ bypass. Because the *structure* only depends on the channel layout, the output device and
+//! the slot count, you can change any filter, switch the whole profile, or disable things, live;
+//! only a layout change, a different output device, or a profile needing more slots than the
+//! installed graph has requires a restart.
 //!
-//! Not supported on this backend: the limiter (reported as a warning), and
-//! more than 8 input channels (the builtin mixer has 8 inputs).
+//! Coefficients are pushed for the sample rate the graph is running at (the caller passes it in
+//! [`Options::sample_rate`]); the config file carries tables for the usual rates, used at start.
+//!
+//! Not supported on this backend: the limiter (reported as a warning), and more than 8 input
+//! channels (the builtin mixer has 8 inputs).
 
 use std::fmt::Write;
 
 use crate::apo::Channel;
-use crate::filter::FilterKind;
+use crate::biquad::Coeffs;
+use crate::filter::Filter;
 use crate::matrix::db_to_lin;
 use crate::setup::Setup;
 
 /// Maximum number of input channels (builtin `mixer` has 8 inputs).
 pub const MAX_INPUTS: usize = 8;
 
-/// Sample rates for which first-order shelves (`bq_raw`) get coefficients.
+/// Fewest filter slots per output channel.
+pub const MIN_SLOTS: usize = 16;
+/// Slot counts are rounded up to a multiple of this, so a slightly bigger profile does not
+/// force a restart.
+pub const SLOT_STEP: usize = 8;
+
+/// Sample rates for which every slot gets a coefficient table in the config.
 const RAW_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 
 #[derive(Debug, Clone)]
@@ -45,10 +53,13 @@ pub struct Options {
     pub description: String,
     /// Used in PipeWire node names: `effect_input.<name>` / `effect_output.<name>`.
     pub node_name: String,
-    /// Sample rate used to decide whether a filter is usable (Fc below Nyquist).
+    /// Sample rate coefficients are computed for when pushed live, and used to decide whether a
+    /// filter is usable (Fc below Nyquist).
     pub sample_rate: f64,
     /// Optional `target.object` for the processed audio (device node name or serial).
     pub target: Option<String>,
+    /// Filter slots per output channel. `None` picks the smallest standard size that fits `setup`.
+    pub slots: Option<usize>,
 }
 
 impl Default for Options {
@@ -58,6 +69,7 @@ impl Default for Options {
             node_name: "linapo".to_string(),
             sample_rate: 48_000.0,
             target: None,
+            slots: None,
         }
     }
 }
@@ -125,22 +137,57 @@ fn positions(chs: &[Channel]) -> String {
     chs.iter().map(position).collect::<Vec<_>>().join(" ")
 }
 
-/// Gain a native filter node should have: a disabled filter sits at 0 dB, which is exactly neutral.
-fn effective_gain(f: &crate::filter::Filter) -> f64 {
-    if f.enabled {
-        f.gain_db
-    } else {
-        0.0
+/// Coefficients for one slot at `rate`: neutral when the slot is unused or its filter disabled.
+fn slot_coeffs(f: Option<&Filter>, rate: f64) -> Option<Coeffs> {
+    match f {
+        Some(f) if f.enabled => f.coeffs(rate).ok(),
+        _ => Some(Coeffs::IDENTITY),
     }
 }
 
-/// Coefficients for a `bq_raw` node at `rate`: identity when the filter is disabled.
-fn raw_coeffs(f: &crate::filter::Filter, rate: f64) -> Option<crate::biquad::Coeffs> {
-    if f.enabled {
-        f.coeffs(rate).ok()
-    } else {
-        Some(crate::biquad::Coeffs::IDENTITY)
+/// The filters of one output channel that can be realised at `rate`, in order. Filters whose
+/// frequency is unusable are dropped (with a warning when they were enabled).
+fn usable_filters(setup: &Setup, ch: &Channel, rate: f64, warnings: &mut Vec<String>) -> Vec<Filter> {
+    let mut out = Vec::new();
+    for f in setup.chain_for_output(ch).filters {
+        match f.coeffs(rate) {
+            Ok(_) => out.push(f),
+            Err(e) => {
+                if f.enabled {
+                    warnings.push(format!("channel {ch}: skipped filter [{f}]: {e}"));
+                }
+            }
+        }
     }
+    out
+}
+
+/// The largest number of filters any output channel needs.
+pub fn required_slots(setup: &Setup, sample_rate: f64) -> usize {
+    let mut ignored = Vec::new();
+    setup.output_channels.iter().map(|c| usable_filters(setup, c, sample_rate, &mut ignored).len()).max().unwrap_or(0)
+}
+
+/// The standard slot count that fits `required` filters.
+pub fn slots_for(required: usize) -> usize {
+    required.div_ceil(SLOT_STEP).max(MIN_SLOTS / SLOT_STEP) * SLOT_STEP
+}
+
+fn resolve_slots(setup: &Setup, opts: &Options) -> usize {
+    opts.slots.unwrap_or_else(|| slots_for(required_slots(setup, opts.sample_rate)))
+}
+
+/// Number of filter slots per channel in an installed config (`0` if it has none).
+pub fn installed_slots(config: &str) -> usize {
+    config
+        .match_indices("name = eq_")
+        .filter_map(|(i, _)| {
+            let rest = &config[i + "name = eq_".len()..];
+            let name: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+            name.rsplit('_').next()?.parse::<usize>().ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Returns the config text and a list of warnings, or an error if the setup
@@ -152,10 +199,9 @@ pub fn generate(setup: &Setup, opts: &Options) -> Result<(String, Vec<String>), 
         return Err("setup needs at least one input and one output channel".into());
     }
     if n_in > MAX_INPUTS {
-        return Err(format!(
-            "{n_in} input channels: the PipeWire builtin mixer supports at most {MAX_INPUTS}"
-        ));
+        return Err(format!("{n_in} input channels: the PipeWire builtin mixer supports at most {MAX_INPUTS}"));
     }
+    let slots = resolve_slots(setup, opts);
 
     let mut warnings = Vec::new();
     if setup.limiter {
@@ -186,7 +232,7 @@ pub fn generate(setup: &Setup, opts: &Options) -> Result<(String, Vec<String>), 
             let _ = writeln!(links, "                    {{ output = \"in_{}:Out\" input = \"mix_{t}:In {}\" }}", tag(in_ch), k + 1);
         }
 
-        // EQ chain.
+        // EQ preamp, then the fixed filter slots.
         let chain = setup.chain_for_output(out_ch);
         let _ = writeln!(
             nodes,
@@ -196,50 +242,32 @@ pub fn generate(setup: &Setup, opts: &Options) -> Result<(String, Vec<String>), 
         let _ = writeln!(links, "                    {{ output = \"mix_{t}:Out\" input = \"pre_{t}:In\" }}");
         let mut prev = format!("pre_{t}");
 
-        let mut n = 0;
-        for f in &chain.filters {
-            if let Err(e) = f.coeffs(opts.sample_rate) {
-                if f.enabled {
-                    warnings.push(format!("channel {out_ch}: skipped filter [{f}]: {e}"));
-                }
-                continue;
-            }
-            n += 1;
+        let mut filters = usable_filters(setup, out_ch, opts.sample_rate, &mut warnings);
+        if filters.len() > slots {
+            warnings.push(format!("channel {out_ch}: {} filters but only {slots} slots; the last {} are ignored", filters.len(), filters.len() - slots));
+            filters.truncate(slots);
+        }
+        for n in 1..=slots {
             let name = format!("eq_{t}_{n}");
-            let native = |label: &str| {
-                format!(
-                    "                    {{ type = builtin name = {name} label = {label} control = {{ \"Freq\" = {} \"Q\" = {} \"Gain\" = {} }} }}\n",
-                    num(f.fc_hz),
-                    num(f.q),
-                    num(effective_gain(f))
-                )
-            };
-            nodes.push_str(&match f.kind {
-                FilterKind::Peaking => native("bq_peaking"),
-                FilterKind::LowShelf => native("bq_lowshelf"),
-                FilterKind::HighShelf => native("bq_highshelf"),
-                _ => {
-                    // bq_raw: coefficients per sample rate in a `config` section (used at start and
-                    // on rate changes); live edits set b0..a2 as controls for the running rate.
-                    let mut entries = String::new();
-                    for rate in RAW_RATES {
-                        if let Some(c) = raw_coeffs(f, rate as f64) {
-                            let _ = write!(
-                                entries,
-                                "{{ rate = {rate} b0 = {} b1 = {} b2 = {} a0 = 1.0 a1 = {} a2 = {} }} ",
-                                num(c.b0),
-                                num(c.b1),
-                                num(c.b2),
-                                num(c.a1),
-                                num(c.a2)
-                            );
-                        }
-                    }
-                    format!(
-                        "                    {{ type = builtin name = {name} label = bq_raw config = {{ coefficients = [ {entries}] }} }}\n"
-                    )
+            let f = filters.get(n - 1);
+            let mut entries = String::new();
+            for rate in RAW_RATES {
+                if let Some(c) = slot_coeffs(f, rate as f64) {
+                    let _ = write!(
+                        entries,
+                        "{{ rate = {rate} b0 = {} b1 = {} b2 = {} a0 = 1.0 a1 = {} a2 = {} }} ",
+                        num(c.b0),
+                        num(c.b1),
+                        num(c.b2),
+                        num(c.a1),
+                        num(c.a2)
+                    );
                 }
-            });
+            }
+            let _ = writeln!(
+                nodes,
+                "                    {{ type = builtin name = {name} label = bq_raw config = {{ coefficients = [ {entries}] }} }}"
+            );
             let _ = writeln!(links, "                    {{ output = \"{prev}:Out\" input = \"{name}:In\" }}");
             prev = name;
         }
@@ -292,16 +320,16 @@ pub fn generate(setup: &Setup, opts: &Options) -> Result<(String, Vec<String>), 
     Ok((out, warnings))
 }
 
-/// Every adjustable value of the generated graph, as `(control, value)` pairs
-/// ready to send in one `Props` param. Mirrors the node numbering of
-/// [`generate`], so it is valid as long as [`skeleton`] of the installed
-/// config equals the skeleton of a freshly generated one.
+/// Every adjustable value of the generated graph, as `(control, value)` pairs ready to send in
+/// one `Props` param. Valid as long as [`skeleton`] of the installed config equals the skeleton of
+/// a freshly generated one (with the installed slot count in `opts.slots`).
 pub fn live_controls(setup: &Setup, opts: &Options) -> Result<Vec<(ControlKey, f64)>, String> {
     setup.validate().map_err(|e| e.to_string())?;
     let n_in = setup.input_channels.len();
     if n_in == 0 || setup.output_channels.is_empty() || n_in > MAX_INPUTS {
         return Err("setup cannot be expressed on this backend".into());
     }
+    let slots = resolve_slots(setup, opts);
     let mut out = Vec::new();
     for (o, ch) in setup.output_channels.iter().enumerate() {
         for k in 0..n_in {
@@ -309,25 +337,13 @@ pub fn live_controls(setup: &Setup, opts: &Options) -> Result<Vec<(ControlKey, f
         }
         let chain = setup.chain_for_output(ch);
         out.push((preamp_control(ch), db_to_lin(chain.gain_db)));
-        let mut n = 0;
-        for f in &chain.filters {
-            if f.coeffs(opts.sample_rate).is_err() {
-                continue;
-            }
-            n += 1;
-            match f.kind {
-                FilterKind::Peaking | FilterKind::LowShelf | FilterKind::HighShelf => {
-                    out.push((filter_control(ch, n, "Freq"), f.fc_hz));
-                    out.push((filter_control(ch, n, "Q"), f.q));
-                    out.push((filter_control(ch, n, "Gain"), effective_gain(f)));
-                }
-                _ => {
-                    // bq_raw: coefficients for the rate the graph is running at (`opts.sample_rate`).
-                    let c = raw_coeffs(f, opts.sample_rate).unwrap_or(crate::biquad::Coeffs::IDENTITY);
-                    for (name, v) in [("b0", c.b0), ("b1", c.b1), ("b2", c.b2), ("a0", 1.0), ("a1", c.a1), ("a2", c.a2)] {
-                        out.push((filter_control(ch, n, name), v));
-                    }
-                }
+        let mut ignored = Vec::new();
+        let mut filters = usable_filters(setup, ch, opts.sample_rate, &mut ignored);
+        filters.truncate(slots);
+        for n in 1..=slots {
+            let c = slot_coeffs(filters.get(n - 1), opts.sample_rate).unwrap_or(Coeffs::IDENTITY);
+            for (name, v) in [("b0", c.b0), ("b1", c.b1), ("b2", c.b2), ("a0", 1.0), ("a1", c.a1), ("a2", c.a2)] {
+                out.push((filter_control(ch, n, name), v));
             }
         }
         out.push((master_control(ch), db_to_lin(setup.master_gain_db)));
@@ -373,7 +389,7 @@ pub fn skeleton(config: &str) -> String {
 mod tests {
     use super::*;
     use crate::apo::{layout_for, parse_str};
-    use crate::filter::{Filter, FilterKind};
+    use crate::filter::FilterKind;
     use crate::matrix::Matrix;
     use crate::setup::EqPreset;
 
@@ -391,28 +407,46 @@ mod tests {
         generate(s, &Options::default()).unwrap().0
     }
 
+    fn line<'a>(cfg: &'a str, node: &str) -> &'a str {
+        cfg.lines().find(|l| l.contains(&format!("name = {node} "))).unwrap_or_else(|| panic!("no node {node}"))
+    }
+
+    fn pk(fc: f64, g: f64) -> Filter {
+        Filter { kind: FilterKind::Peaking, fc_hz: fc, gain_db: g, q: 1.0, enabled: true }
+    }
+
+    const IDENTITY_48K: &str = "rate = 48000 b0 = 1.0 b1 = 0.0 b2 = 0.0 a0 = 1.0 a1 = 0.0 a2 = 0.0";
+
     #[test]
     fn stereo_config_has_expected_structure() {
-        let cfg = gen(&from_apo(
-            "Preamp: -6 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1.41\nFilter 2: ON LSC Fc 100 Hz Gain 4 dB Q 0.7\n",
-            2,
-        ));
+        let cfg = gen(&from_apo("Preamp: -6 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1.41\nFilter 2: ON LSC Fc 100 Hz Gain 4 dB Q 0.7\n", 2));
         assert!(cfg.contains("libpipewire-module-filter-chain"));
         assert!(cfg.contains("name = in_l label = copy"));
         assert!(cfg.contains("name = mix_l label = mixer control = { \"Gain 1\" = 1.0 \"Gain 2\" = 0.0 \"Gain 3\" = 0.0"));
         assert!(cfg.contains("name = mix_r label = mixer control = { \"Gain 1\" = 0.0 \"Gain 2\" = 1.0"));
         assert!(cfg.contains("name = pre_l label = linear control = { \"Mult\" = 0.501187"));
-        assert!(cfg.contains("name = eq_l_1 label = bq_peaking control = { \"Freq\" = 1000.0 \"Q\" = 1.41 \"Gain\" = 3.0 }"));
-        assert!(cfg.contains("name = eq_r_2 label = bq_lowshelf"));
         assert!(cfg.contains("{ output = \"in_l:Out\" input = \"mix_l:In 1\" }"));
         assert!(cfg.contains("{ output = \"in_r:Out\" input = \"mix_l:In 2\" }"));
         assert!(cfg.contains("{ output = \"mix_l:Out\" input = \"pre_l:In\" }"));
         assert!(cfg.contains("{ output = \"pre_l:Out\" input = \"eq_l_1:In\" }"));
-        assert!(cfg.contains("{ output = \"eq_l_2:Out\" input = \"master_l:In\" }"));
+        assert!(cfg.contains("{ output = \"eq_l_1:Out\" input = \"eq_l_2:In\" }"));
+        assert!(cfg.contains(&format!("{{ output = \"eq_r_{MIN_SLOTS}:Out\" input = \"master_r:In\" }}")));
         assert!(cfg.contains("inputs  = [ \"in_l:In\" \"in_r:In\" ]"));
         assert!(cfg.contains("outputs = [ \"master_l:Out\" \"master_r:Out\" ]"));
         assert!(cfg.contains("audio.position = [ FL FR ]"));
         assert!(cfg.contains("media.class    = Audio/Sink"));
+        // slot 1 carries the peaking filter, slot 3 is neutral
+        assert!(!line(&cfg, "eq_l_1").contains(IDENTITY_48K));
+        assert!(line(&cfg, "eq_l_3").contains(IDENTITY_48K));
+    }
+
+    #[test]
+    fn every_filter_is_a_raw_biquad_and_no_native_filter_nodes_remain() {
+        let cfg = gen(&from_apo("Filter: ON PK Fc 1000 Hz Gain 3 dB Q 1\nFilter: ON LP Fc 5000 Hz\nFilter: ON NO Fc 60 Hz Q 5\n", 2));
+        for native in ["bq_peaking", "bq_lowshelf", "bq_highshelf", "bq_lowpass", "bq_highpass", "bq_bandpass", "bq_notch", "bq_allpass"] {
+            assert!(!cfg.contains(native), "{native}");
+        }
+        assert_eq!(cfg.matches("label = bq_raw").count(), 2 * MIN_SLOTS);
     }
 
     #[test]
@@ -424,16 +458,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_setup_is_a_passthrough_graph() {
-        let s = Setup::passthrough(&layout_for(2));
-        let cfg = gen(&s);
+    fn empty_setup_is_a_passthrough_graph_with_neutral_slots() {
+        let cfg = gen(&Setup::passthrough(&layout_for(2)));
         assert!(cfg.contains("name = master_l label = linear control = { \"Mult\" = 1.0"));
-        assert!(cfg.contains("{ output = \"pre_l:Out\" input = \"master_l:In\" }"));
+        for n in 1..=MIN_SLOTS {
+            let l = line(&cfg, &format!("eq_l_{n}"));
+            assert!(l.contains(IDENTITY_48K) && l.contains("rate = 44100") && l.contains("rate = 192000"), "slot {n}");
+        }
     }
 
     #[test]
     fn matrix_routes_and_volumes_land_in_mixer_gains() {
-        // stereo in -> 5.1 out, with a -6 dB route and a polarity flip
         let mut s = Setup::passthrough(&layout_for(6));
         s.input_channels = layout_for(2);
         s.matrix = Matrix::zeros(2, 6);
@@ -446,9 +481,7 @@ mod tests {
         assert!(cfg.contains("name = mix_rl label = mixer control = { \"Gain 1\" = 0.501187"));
         assert!(cfg.contains("\"Gain 2\" = -0.5 "));
         assert!(cfg.contains("name = mix_c label = mixer control = { \"Gain 1\" = 0.0 \"Gain 2\" = 0.0 "));
-        // capture side has 2 channels, playback side 6
-        assert!(cfg.contains("audio.channels = 2"));
-        assert!(cfg.contains("audio.channels = 6"));
+        assert!(cfg.contains("audio.channels = 2") && cfg.contains("audio.channels = 6"));
         assert!(cfg.contains("audio.position = [ FL FR ]"));
         assert!(cfg.contains("audio.position = [ FL FR FC LFE RL RR ]"));
         assert!(cfg.contains("{ output = \"in_r:Out\" input = \"mix_rl:In 2\" }"));
@@ -458,14 +491,19 @@ mod tests {
     fn eq_assignment_is_per_output_channel() {
         let mut s = Setup::passthrough(&layout_for(2));
         s.limiter = false;
-        let pk = |f| Filter { kind: FilterKind::Peaking, fc_hz: f, gain_db: 3.0, q: 1.0, enabled: true };
-        s.eqs.push(EqPreset { name: "a".into(), enabled: true, preamp_db: 0.0, filters: vec![pk(100.0)], channels: vec![ch("L")] });
-        s.eqs.push(EqPreset { name: "b".into(), enabled: true, preamp_db: 0.0, filters: vec![pk(200.0)], channels: vec![ch("L"), ch("R")] });
+        s.eqs.push(EqPreset { name: "a".into(), enabled: true, preamp_db: 0.0, filters: vec![pk(100.0, 3.0)], channels: vec![ch("L")] });
+        s.eqs.push(EqPreset { name: "b".into(), enabled: true, preamp_db: 0.0, filters: vec![pk(200.0, 3.0)], channels: vec![ch("L"), ch("R")] });
         let cfg = gen(&s);
-        assert!(cfg.contains("name = eq_l_1 label = bq_peaking control = { \"Freq\" = 100.0"));
-        assert!(cfg.contains("name = eq_l_2 label = bq_peaking control = { \"Freq\" = 200.0"));
-        assert!(cfg.contains("name = eq_r_1 label = bq_peaking control = { \"Freq\" = 200.0"));
-        assert!(!cfg.contains("eq_r_2"));
+        let b0 = |node: &str| {
+            let l = line(&cfg, node);
+            let i = l.find("rate = 48000 b0 = ").unwrap() + "rate = 48000 b0 = ".len();
+            l[i..].split_whitespace().next().unwrap().to_string()
+        };
+        assert_ne!(b0("eq_l_1"), "1.0");
+        assert_ne!(b0("eq_l_2"), "1.0");
+        assert_ne!(b0("eq_r_1"), "1.0", "R has the shared EQ");
+        assert_eq!(b0("eq_r_2"), "1.0", "but not the L-only one");
+        assert_ne!(b0("eq_l_1"), b0("eq_r_1"), "L's first filter is 100 Hz, R's is 200 Hz");
     }
 
     #[test]
@@ -473,118 +511,26 @@ mod tests {
         let mut s = Setup::passthrough(&layout_for(2));
         s.master_gain_db = -6.0;
         s.limiter = false;
-        let cfg = gen(&s);
-        assert_eq!(cfg.matches("\"Mult\" = 0.501187").count(), 2);
+        assert_eq!(gen(&s).matches("\"Mult\" = 0.501187").count(), 2);
     }
 
     #[test]
-    fn first_order_shelf_becomes_bq_raw_and_bad_filters_are_skipped() {
-        let (cfg, warnings) = generate(
-            &from_apo("Filter: ON LS 6dB Fc 50 Hz Gain 5 dB\nFilter: ON PK Fc 30000 Hz Gain 3 dB Q 1\n", 2),
-            &Options::default(),
-        )
-        .unwrap();
-        assert!(cfg.contains("label = bq_raw config = { coefficients = [ { rate = 44100 "));
-        for r in ["44100", "48000", "96000", "192000"] {
-            assert!(cfg.contains(&format!("rate = {r} ")), "{r}");
-        }
-        assert!(cfg.contains("a0 = 1.0"));
-        assert_eq!(warnings.len(), 2); // once per channel
-        assert!(!cfg.contains("30000"));
-    }
-
-    #[test]
-    fn first_order_shelf_coefficients_follow_the_sample_rate() {
-        let (cfg, _) = generate(&from_apo("Filter: ON LS 6dB Fc 100 Hz Gain 5 dB\n", 2), &Options::default()).unwrap();
-        let line = cfg.lines().find(|l| l.contains("name = eq_l_1")).unwrap();
-        let b0_of = |rate: &str| -> String {
-            let i = line.find(&format!("rate = {rate} b0 = ")).unwrap();
-            line[i..].split_whitespace().nth(5).unwrap().to_string()
-        };
-        assert_ne!(b0_of("44100"), b0_of("96000"));
-    }
-
-    #[test]
-    fn non_gain_kinds_use_exact_raw_coefficients_not_pipewires_native_nodes() {
-        let (cfg, _) = generate(
-            &from_apo("Filter: ON LP Fc 1000 Hz\nFilter: ON HPQ Fc 80 Hz Q 0.9\nFilter: ON BP Fc 500 Hz Q 2\nFilter: ON PK Fc 200 Hz Gain 2 dB Q 1\n", 2),
-            &Options::default(),
-        )
-        .unwrap();
-        for bad in ["bq_lowpass", "bq_highpass", "bq_bandpass", "bq_notch", "bq_allpass"] {
-            assert!(!cfg.contains(bad), "{bad}");
-        }
-        for n in 1..=3 {
-            assert!(cfg.contains(&format!("name = eq_l_{n} label = bq_raw")), "{n}");
-        }
-        assert!(cfg.contains("name = eq_l_4 label = bq_peaking"));
-        // low-pass is now live-editable through its coefficients
-        let ctl = live_controls(&from_apo("Filter: ON LP Fc 1000 Hz\n", 2), &Options::default()).unwrap();
-        assert!(ctl.iter().any(|(k, _)| k.0 == "eq_l_1:b0"));
-    }
-
-    #[test]
-    fn live_raw_coefficients_match_the_filter_at_the_requested_rate() {
-        let s = from_apo("Filter: ON LP Fc 1000 Hz\n", 2);
-        for rate in [44_100.0, 48_000.0, 96_000.0] {
-            let opts = Options { sample_rate: rate, ..Options::default() };
-            let ctl = live_controls(&s, &opts).unwrap();
-            let get = |k: &str| ctl.iter().find(|(c, _)| c.0 == k).unwrap().1;
-            let want = s.eqs[0].filters[0].coeffs(rate).unwrap();
-            assert_eq!((get("eq_l_1:b0"), get("eq_l_1:a1"), get("eq_l_1:a2")), (want.b0, want.a1, want.a2));
-        }
-    }
-
-    #[test]
-    fn disabled_filters_stay_in_the_graph_with_neutral_values() {
-        let mut s = from_apo("Filter: ON PK Fc 1000 Hz Gain 6 dB Q 1\nFilter: ON HP Fc 80 Hz\n", 2);
-        s.eqs[0].filters[0].enabled = false;
-        s.eqs[0].filters[1].enabled = false;
-        let opts = Options::default();
-        let (cfg, w) = generate(&s, &opts).unwrap();
-        assert!(w.is_empty());
-        assert!(cfg.contains("name = eq_l_1 label = bq_peaking control = { \"Freq\" = 1000.0 \"Q\" = 1.0 \"Gain\" = 0.0 }"), "gain 0 = neutral");
-        assert!(cfg.contains("rate = 48000 b0 = 1.0 b1 = 0.0 b2 = 0.0 a0 = 1.0 a1 = 0.0 a2 = 0.0"), "identity coefficients");
-        let ctl = live_controls(&s, &opts).unwrap();
-        let get = |k: &str| ctl.iter().find(|(c, _)| c.0 == k).unwrap().1;
-        assert_eq!(get("eq_l_1:Gain"), 0.0);
-        assert_eq!((get("eq_l_2:b0"), get("eq_l_2:b1"), get("eq_l_2:a1")), (1.0, 0.0, 0.0));
-    }
-
-    #[test]
-    fn toggling_a_filter_or_the_bypass_never_changes_the_structure() {
-        let on = from_apo("Preamp: -3 dB\nFilter: ON PK Fc 1000 Hz Gain 6 dB Q 1\nFilter: ON LP Fc 5000 Hz\nFilter: ON NO Fc 60 Hz Q 5\n", 2);
-        let opts = Options::default();
-        let sk = |s: &Setup| skeleton(&generate(s, &opts).unwrap().0);
-        for i in 0..3 {
-            let mut off = on.clone();
-            off.eqs[0].filters[i].enabled = false;
-            assert_eq!(sk(&on), sk(&off), "filter {i}");
-        }
-        let mut b = on.clone();
-        b.bypass_eq = true;
-        assert_eq!(sk(&on), sk(&b), "bypass");
-        // but changing a low-pass frequency (a coefficient table value) is a value, not structure
-        let mut moved = on.clone();
-        moved.eqs[0].filters[1].fc_hz = 9000.0;
-        assert_eq!(sk(&on), sk(&moved));
-        // while turning a peak into a low-pass is a different node type
-        let mut kind = on.clone();
-        kind.eqs[0].filters[0].kind = FilterKind::LowPass;
-        assert_ne!(sk(&on), sk(&kind));
+    fn unusable_filters_are_skipped_with_a_warning_and_do_not_use_a_slot() {
+        let (cfg, w) = generate(&from_apo("Filter: ON PK Fc 30000 Hz Gain 3 dB Q 1\nFilter: ON PK Fc 500 Hz Gain 3 dB Q 1\n", 2), &Options::default()).unwrap();
+        assert_eq!(w.len(), 2); // once per channel
+        assert!(!line(&cfg, "eq_l_1").contains(IDENTITY_48K), "the 500 Hz filter moved up into slot 1");
+        assert!(line(&cfg, "eq_l_2").contains(IDENTITY_48K));
     }
 
     #[test]
     fn limiter_is_reported_as_unsupported() {
-        let s = Setup::passthrough(&layout_for(2)); // limiter on by default
-        let (_, w) = generate(&s, &Options::default()).unwrap();
+        let (_, w) = generate(&Setup::passthrough(&layout_for(2)), &Options::default()).unwrap();
         assert!(w.iter().any(|m| m.contains("limiter")));
     }
 
     #[test]
     fn too_many_inputs_is_an_error() {
-        let s = Setup::passthrough(&layout_for(10));
-        assert!(generate(&s, &Options::default()).unwrap_err().contains("at most 8"));
+        assert!(generate(&Setup::passthrough(&layout_for(10)), &Options::default()).unwrap_err().contains("at most 8"));
     }
 
     #[test]
@@ -606,9 +552,8 @@ mod tests {
         assert!(cfg.contains("target.object  = \"alsa_output.usb\""));
         let opts = Options { target: Some("other".into()), ..Options::default() };
         assert!(generate(&s, &opts).unwrap().0.contains("target.object  = \"other\""));
-        // and a different device is a structural change
         let a = skeleton(&generate(&Setup::passthrough(&layout_for(2)), &Options::default()).unwrap().0);
-        assert_ne!(a, skeleton(&generate(&s, &Options::default()).unwrap().0));
+        assert_ne!(a, skeleton(&generate(&s, &Options::default()).unwrap().0), "a different device is structural");
     }
 
     #[test]
@@ -616,7 +561,7 @@ mod tests {
         assert_eq!(matrix_control(&ch("R"), 0).to_string(), "mix_r:Gain 1");
         assert_eq!(master_control(&ch("SUB")).to_string(), "master_sub:Mult");
         assert_eq!(preamp_control(&ch("L")).to_string(), "pre_l:Mult");
-        assert_eq!(filter_control(&ch("L"), 3, "Freq").to_string(), "eq_l_3:Freq");
+        assert_eq!(filter_control(&ch("L"), 3, "b0").to_string(), "eq_l_3:b0");
     }
 
     #[test]
@@ -627,26 +572,58 @@ mod tests {
         assert_eq!(position(&ch("CH1")), "AUX0");
     }
 
+    // ------------------------------------------------------------ slots
+
     #[test]
-    fn live_controls_cover_every_value_and_match_config() {
-        let s = from_apo(
-            "Preamp: -6 dB\nFilter: ON PK Fc 1000 Hz Gain 3 dB Q 1.41\nFilter: ON LS 6dB Fc 80 Hz Gain 4 dB\n\
-             Filter: ON PK Fc 30000 Hz Gain 3 dB Q 1\n",
-            2,
-        );
+    fn slot_counts() {
+        assert_eq!(slots_for(0), 16);
+        assert_eq!(slots_for(16), 16);
+        assert_eq!(slots_for(17), 24);
+        assert_eq!(slots_for(31), 32);
+        assert_eq!(slots_for(40), 40);
+        let s = from_apo("Filter: ON PK Fc 1000 Hz Gain 3 dB Q 1\nChannel: R\nFilter: ON PK Fc 2000 Hz Gain 3 dB Q 1\nFilter: ON PK Fc 3000 Hz Gain 3 dB Q 1\n", 2);
+        assert_eq!(required_slots(&s, 48_000.0), 3, "the busiest channel counts");
+    }
+
+    #[test]
+    fn installed_slot_count_is_read_back_from_a_config() {
+        let s = from_apo("Filter: ON PK Fc 1000 Hz Gain 3 dB Q 1\n", 6);
+        assert_eq!(installed_slots(&gen(&s)), MIN_SLOTS);
+        let opts = Options { slots: Some(24), ..Options::default() };
+        assert_eq!(installed_slots(&generate(&s, &opts).unwrap().0), 24);
+        assert_eq!(installed_slots("nothing here"), 0);
+    }
+
+    #[test]
+    fn a_profile_with_more_filters_than_slots_warns_and_is_truncated() {
+        let mut s = Setup::passthrough(&layout_for(2));
+        s.limiter = false;
+        s.eqs.push(EqPreset { name: "big".into(), enabled: true, preamp_db: 0.0, filters: (0..20).map(|i| pk(100.0 + 50.0 * i as f64, 2.0)).collect(), channels: layout_for(2) });
+        let (_, w) = generate(&s, &Options { slots: Some(16), ..Options::default() }).unwrap();
+        assert_eq!(w.iter().filter(|m| m.contains("only 16 slots")).count(), 2);
+        // with automatic sizing it simply gets 24 slots
+        let (cfg, w) = generate(&s, &Options::default()).unwrap();
+        assert!(w.is_empty() && cfg.contains("name = eq_l_24 "));
+    }
+
+    #[test]
+    fn live_controls_cover_matrix_preamp_every_slot_and_master() {
+        let s = from_apo("Preamp: -6 dB\nFilter: ON PK Fc 1000 Hz Gain 6 dB Q 1\nFilter: ON LP Fc 5000 Hz\n", 2);
         let opts = Options::default();
         let ctl = live_controls(&s, &opts).unwrap();
-        let get = |k: &str| ctl.iter().find(|(c, _)| c.0 == k).map(|(_, v)| *v);
-        assert_eq!(get("mix_l:Gain 1"), Some(1.0));
-        assert_eq!(get("mix_l:Gain 2"), Some(0.0));
-        assert!((get("pre_l:Mult").unwrap() - 0.501187).abs() < 1e-5);
-        assert_eq!(get("eq_l_1:Freq"), Some(1000.0));
-        assert_eq!(get("eq_l_1:Gain"), Some(3.0));
-        assert!(get("eq_l_2:b0").is_some() && get("eq_l_2:a0") == Some(1.0), "first-order shelves are live via raw coefficients");
-        assert_eq!(get("eq_l_3:Freq"), None, "the invalid 30 kHz filter is skipped, like in generate()");
-        assert_eq!(get("master_r:Mult"), Some(1.0));
-        // every control key refers to a node that exists in the generated config
-        let (cfg, _) = generate(&s, &opts).unwrap();
+        assert_eq!(ctl.len(), 2 * (2 + 1 + MIN_SLOTS * 6 + 1));
+        let get = |k: &str| ctl.iter().find(|(c, _)| c.0 == k).map(|(_, v)| *v).unwrap_or_else(|| panic!("{k}"));
+        assert_eq!(get("mix_l:Gain 1"), 1.0);
+        assert!((get("pre_l:Mult") - 0.501187).abs() < 1e-5);
+        let want = s.eqs[0].filters[0].coeffs(48_000.0).unwrap();
+        assert_eq!((get("eq_l_1:b0"), get("eq_l_1:a1"), get("eq_l_1:a2")), (want.b0, want.a1, want.a2));
+        let lp = s.eqs[0].filters[1].coeffs(48_000.0).unwrap();
+        assert_eq!(get("eq_r_2:b1"), lp.b1);
+        assert_eq!((get("eq_l_3:b0"), get("eq_l_3:b1"), get("eq_l_3:a1")), (1.0, 0.0, 0.0), "unused slot is neutral");
+        assert_eq!(get("eq_l_1:a0"), 1.0);
+        assert_eq!(get("master_r:Mult"), 1.0);
+        // every key names a node that exists in the config
+        let cfg = gen(&s);
         for (k, _) in &ctl {
             let node = k.0.split(':').next().unwrap();
             assert!(cfg.contains(&format!("name = {node} ")), "{k}");
@@ -654,24 +631,71 @@ mod tests {
     }
 
     #[test]
-    fn skeleton_ignores_values_but_not_structure() {
-        let a = from_apo("Filter: ON PK Fc 1000 Hz Gain 3 dB Q 1\n", 2);
-        let mut b = a.clone();
-        b.eqs[0].filters[0].gain_db = -4.0;
-        b.eqs[0].filters[0].fc_hz = 2500.0;
-        b.master_gain_db = -3.0;
-        b.matrix.set(0, 1, 0.3);
+    fn live_coefficients_follow_the_requested_rate() {
+        let s = from_apo("Filter: ON LP Fc 1000 Hz\n", 2);
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            let opts = Options { sample_rate: rate, ..Options::default() };
+            let ctl = live_controls(&s, &opts).unwrap();
+            let get = |k: &str| ctl.iter().find(|(c, _)| c.0 == k).unwrap().1;
+            let want = s.eqs[0].filters[0].coeffs(rate).unwrap();
+            assert_eq!((get("eq_l_1:b0"), get("eq_l_1:a1"), get("eq_l_1:a2")), (want.b0, want.a1, want.a2));
+        }
+    }
+
+    #[test]
+    fn disabled_filters_and_bypass_become_neutral_slots_without_changing_the_graph() {
+        let mut s = from_apo("Filter: ON PK Fc 1000 Hz Gain 6 dB Q 1\nFilter: ON HP Fc 80 Hz\n", 2);
+        let opts = Options::default();
+        let neutral = |s: &Setup, node: &str| {
+            let ctl = live_controls(s, &opts).unwrap();
+            let get = |p: &str| ctl.iter().find(|(c, _)| c.0 == format!("{node}:{p}")).unwrap().1;
+            (get("b0"), get("b1"), get("b2"), get("a1"), get("a2")) == (1.0, 0.0, 0.0, 0.0, 0.0)
+        };
+        assert!(!neutral(&s, "eq_l_1") && !neutral(&s, "eq_l_2"));
+        s.eqs[0].filters[0].enabled = false;
+        assert!(neutral(&s, "eq_l_1") && !neutral(&s, "eq_l_2"));
+        s.eqs[0].filters[0].enabled = true;
+        s.bypass_eq = true;
+        assert!(neutral(&s, "eq_l_1") && neutral(&s, "eq_l_2"));
+        let (cfg, w) = generate(&s, &opts).unwrap();
+        assert!(w.is_empty() && line(&cfg, "eq_l_1").contains(IDENTITY_48K));
+    }
+
+    #[test]
+    fn changing_filters_or_switching_profiles_never_changes_the_structure_within_capacity() {
+        let a = from_apo("Preamp: -3 dB\nFilter: ON PK Fc 1000 Hz Gain 6 dB Q 1\nFilter: ON LP Fc 5000 Hz\n", 2);
+        let b = from_apo("Filter: ON HSC Fc 8000 Hz Gain -4 dB Q 0.7\nFilter: ON NO Fc 60 Hz Q 5\nFilter: ON PK Fc 200 Hz Gain 2 dB Q 2\nFilter: ON AP Fc 500 Hz Q 1\n", 2);
         let opts = Options::default();
         let sk = |s: &Setup| skeleton(&generate(s, &opts).unwrap().0);
-        assert_eq!(sk(&a), sk(&b));
-
+        assert_eq!(sk(&a), sk(&b), "a completely different EQ: same graph");
         let mut c = a.clone();
-        let first = c.eqs[0].filters[0];
-        c.eqs[0].filters.push(first);
-        assert_ne!(sk(&a), sk(&c), "an extra filter changes the structure");
-        let mut d = a.clone();
-        d.eqs[0].filters[0].kind = FilterKind::LowShelf;
-        assert_ne!(sk(&a), sk(&d), "a different filter type changes the structure");
-        assert_ne!(sk(&a), sk(&from_apo("", 6)), "channel layout changes the structure");
+        c.bypass_eq = true;
+        c.master_gain_db = -3.0;
+        c.matrix.set(0, 1, 0.3);
+        c.eqs[0].filters[0].enabled = false;
+        c.eqs[0].filters[1].kind = FilterKind::HighPass;
+        assert_eq!(sk(&a), sk(&c));
+        assert_eq!(sk(&a), sk(&Setup::passthrough(&layout_for(2))), "even an empty profile");
+    }
+
+    #[test]
+    fn layout_device_and_slot_count_are_the_structural_parts() {
+        let a = from_apo("Filter: ON PK Fc 1000 Hz Gain 6 dB Q 1\n", 2);
+        let sk = |s: &Setup, o: &Options| skeleton(&generate(s, o).unwrap().0);
+        let o = Options::default();
+        assert_ne!(sk(&a, &o), sk(&from_apo("", 6), &o), "channel layout");
+        let mut dev = a.clone();
+        dev.output_target = Some("alsa_output.x".into());
+        assert_ne!(sk(&a, &o), sk(&dev, &o), "output device");
+        assert_ne!(sk(&a, &o), sk(&a, &Options { slots: Some(24), ..Options::default() }), "slot count");
+        // a profile needing 17 filters picks 24 slots automatically: structural vs the 16-slot graph
+        let big = {
+            let mut s = a.clone();
+            for i in 0..17 {
+                s.eqs[0].filters.push(pk(100.0 + 30.0 * i as f64, 1.0));
+            }
+            s
+        };
+        assert_ne!(sk(&a, &o), sk(&big, &o));
     }
 }

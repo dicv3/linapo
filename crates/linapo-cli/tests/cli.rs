@@ -153,17 +153,22 @@ fn gen_config_and_live_dry_run_agree() {
     };
     let (good, out, _) = dry(&apo);
     assert!(good);
-    assert!(out.contains("mix_l:Gain 1 = 0.5") && out.contains("eq_l_1:Gain = 4.0"), "{out}");
+    assert!(out.contains("mix_l:Gain 1 = 0.5") && out.contains("eq_l_1:b0 = "), "{out}");
+    assert!(!out.contains("eq_l_1:b0 = 1.0\n"), "slot 1 carries the peaking filter: {out}");
 
     // value-only change: accepted
     let tweaked = write(&d, "p2.txt", &PROFILE.replace("Gain 4 dB", "Gain 2 dB"));
     let (good, out, _) = dry(&tweaked);
-    assert!(good && out.contains("eq_l_1:Gain = 2.0"));
+    assert!(good && !out.contains("eq_l_1:b0 = 1.0\n"));
 
-    // structural change (extra filter): refused with a clear message
+    // an extra filter is still a live edit: there are spare slots
     let more = write(&d, "p3.txt", &format!("{PROFILE}Filter: ON PK Fc 200 Hz Gain 1 dB Q 1\n"));
-    let (good, _, err) = dry(&more);
-    assert!(!good && err.contains("linapo install"), "{err}");
+    let (good, out, _) = dry(&more);
+    assert!(good && !out.contains("eq_l_2:b0 = 1.0\n"), "{out}");
+
+    // a different channel layout is structural: refused with a clear message
+    let o = run(bin().env("XDG_CONFIG_HOME", &home).args(["live", "apply"]).arg(&tweaked).args(["--layout", "5.1", "--dry-run"]));
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("linapo install"));
 }
 
 #[test]
@@ -174,4 +179,91 @@ fn live_commands_fail_cleanly_without_a_running_pipewire() {
     let o = run(bin().env("XDG_RUNTIME_DIR", d.join("nonexistent")).args(["live", "master"]).arg(&json).arg("-6"));
     assert!(!o.status.success());
     assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked"));
+}
+
+// ---------------------------------------------------------------- profiles
+
+fn with_config(dir: &Path) -> Command {
+    let mut c = bin();
+    c.env("XDG_CONFIG_HOME", dir.join("cfg")).env("XDG_RUNTIME_DIR", dir.join("run-missing"));
+    c
+}
+
+#[test]
+fn profile_lifecycle_from_the_command_line() {
+    let d = tmp("profiles");
+    let list = |d: &Path| ok(&mut { let mut c = with_config(d); c.args(["profile", "list"]); c });
+    assert_eq!(list(&d).trim(), "* Default", "first run creates and activates a Default profile");
+
+    let apo = write(&d, "cans.txt", "Preamp: -3 dB\nFilter: ON PK Fc 1000 Hz Gain 4 dB Q 1\n");
+    ok(with_config(&d).args(["profile", "save", "Headphones"]).arg(&apo));
+    ok(with_config(&d).args(["profile", "new", "Room", "--layout", "5.1"]));
+    assert!(!run(with_config(&d).args(["profile", "new", "Room"])).status.success(), "no silent overwrite");
+    assert_eq!(list(&d).lines().count(), 3);
+
+    ok(with_config(&d).args(["profile", "copy", "Headphones", "Cans copy"]));
+    ok(with_config(&d).args(["profile", "rename", "Cans copy", "Cans"]));
+    assert!(list(&d).contains("Cans"));
+    assert!(!run(with_config(&d).args(["profile", "rename", "Cans", "Room"])).status.success());
+    assert!(!run(with_config(&d).args(["profile", "new", "bad/name"])).status.success());
+
+    let path = ok(with_config(&d).args(["profile", "path", "Headphones"]));
+    let info = ok(bin().arg("info").arg(path.trim()));
+    assert!(info.contains("1 filter(s)") && info.contains("-3.00 dB"), "{info}");
+
+    ok(with_config(&d).args(["profile", "delete", "Cans"]));
+    assert_eq!(list(&d).lines().count(), 3);
+    assert!(!run(with_config(&d).args(["profile", "delete", "ghost"])).status.success());
+}
+
+#[test]
+fn using_a_profile_when_nothing_is_installed_activates_it_and_says_so() {
+    let d = tmp("use");
+    ok(with_config(&d).args(["profile", "new", "Other"]));
+    let out = ok(with_config(&d).args(["profile", "use", "Other"]));
+    assert!(out.contains("now the active profile") && out.contains("not installed"), "{out}");
+    assert_eq!(ok(with_config(&d).args(["profile", "active"])).trim(), "Other");
+    assert!(!run(with_config(&d).args(["profile", "use", "ghost"])).status.success());
+    assert_eq!(ok(with_config(&d).args(["profile", "active"])).trim(), "Other", "a failed switch changes nothing");
+}
+
+#[test]
+fn bindings_commands_edit_the_state() {
+    let d = tmp("bindings");
+    ok(with_config(&d).args(["profile", "new", "Cans"]));
+    ok(with_config(&d).args(["bindings", "set", "alsa_output.usb", "Cans"]));
+    assert!(!run(with_config(&d).args(["bindings", "set", "dev", "ghost"])).status.success());
+    ok(with_config(&d).args(["bindings", "default", "Default"]));
+    ok(with_config(&d).args(["bindings", "auto", "on"]));
+    let l = ok(with_config(&d).args(["bindings", "list"]));
+    assert!(l.contains("automatic switching: on") && l.contains("alsa_output.usb -> Cans") && l.contains("default profile:     Default"), "{l}");
+    assert!(!run(with_config(&d).args(["bindings", "auto", "maybe"])).status.success());
+    ok(with_config(&d).args(["bindings", "remove", "alsa_output.usb"]));
+    ok(with_config(&d).args(["bindings", "default", "none"]));
+    let l = ok(with_config(&d).args(["bindings", "list"]));
+    assert!(l.contains("no devices are bound") && l.contains("(leave the profile alone)"), "{l}");
+    // deleting a profile removes its bindings
+    ok(with_config(&d).args(["bindings", "set", "x", "Cans"]));
+    ok(with_config(&d).args(["profile", "delete", "Cans"]));
+    assert!(ok(with_config(&d).args(["bindings", "list"])).contains("no devices are bound"));
+}
+
+#[test]
+fn device_and_watch_fail_cleanly_without_pipewire() {
+    let d = tmp("nodev");
+    let o = run(with_config(&d).arg("device"));
+    assert!(!o.status.success() && !String::from_utf8_lossy(&o.stderr).contains("panicked"));
+    assert!(!run(with_config(&d).args(["watch", "--interval", "0"])).status.success());
+    let s = ok(with_config(&d).args(["autostart", "status"]));
+    assert!(s.contains("unit file:") && s.contains("absent"), "{s}");
+}
+
+#[test]
+fn a_legacy_setup_json_becomes_the_default_profile() {
+    let d = tmp("migrate");
+    std::fs::create_dir_all(d.join("cfg/linapo")).unwrap();
+    std::fs::write(d.join("cfg/linapo/setup.json"), r#"{"input_channels":["L","R"],"output_channels":["L","R"],"matrix":[[1,0],[0,1]],"master_gain_db":-6}"#).unwrap();
+    let path = ok(with_config(&d).args(["profile", "path", "Default"]));
+    let info = ok(bin().arg("info").arg(path.trim()));
+    assert!(info.contains("master gain: -6.00 dB"), "{info}");
 }

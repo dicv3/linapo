@@ -5,6 +5,7 @@ use clap::{Args, Parser, Subcommand};
 use linapo_core::matrix::lin_to_db;
 use linapo_core::matrix::db_to_lin;
 use linapo_core::pipewire_conf::{generate, live_controls, master_control, matrix_control, Options};
+use linapo_core::profiles::Workspace;
 use linapo_core::{layout_for, parse_file, response_db, Channel, Engine, Setup};
 
 #[derive(Parser)]
@@ -96,6 +97,83 @@ enum Cmd {
     /// Change values of the running virtual sink without restarting PipeWire.
     #[command(subcommand)]
     Live(LiveCmd),
+
+    /// Named profiles: save, switch, copy, delete.
+    #[command(subcommand)]
+    Profile(ProfileCmd),
+
+    /// Which profile goes with which output device, and automatic switching.
+    #[command(subcommand)]
+    Bindings(BindingsCmd),
+
+    /// Show the output device LinAPO is currently playing to.
+    Device,
+
+    /// Switch profiles automatically when the output device changes (runs until stopped).
+    Watch {
+        /// Seconds between checks.
+        #[arg(long, default_value_t = 0.5)]
+        interval: f64,
+    },
+
+    /// Start `linapo watch` automatically at login (systemd user service).
+    #[command(subcommand)]
+    Autostart(AutostartCmd),
+}
+
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// List profiles; the active one is marked with *.
+    List,
+    /// Print the name of the active profile.
+    Active,
+    /// Print the file a profile is stored in.
+    Path { name: String },
+    /// Create a pass-through profile.
+    New {
+        name: String,
+        #[arg(long, default_value = "stereo")]
+        layout: String,
+    },
+    /// Store a setup (.json) or an Equalizer APO profile (.txt) as a profile, overwriting it.
+    Save {
+        name: String,
+        #[command(flatten)]
+        src: Source,
+    },
+    /// Make a profile the active one and apply it live. Fails if that needs a restart, unless --install.
+    Use {
+        name: String,
+        /// Reinstall (restarting PipeWire) if the profile needs more filter slots or other channels.
+        #[arg(long)]
+        install: bool,
+    },
+    Copy { from: String, to: String },
+    Rename { from: String, to: String },
+    Delete { name: String },
+}
+
+#[derive(Subcommand)]
+enum BindingsCmd {
+    /// Show bindings, the default profile, and whether automatic switching is on.
+    List,
+    /// Use a profile whenever this output device (PipeWire node name) is in use.
+    Set { device: String, profile: String },
+    /// Bind the output device that is in use right now.
+    Here { profile: String },
+    Remove { device: String },
+    /// Profile for devices without a binding ("none" to leave the profile alone).
+    Default { profile: String },
+    /// Turn automatic switching "on" or "off".
+    Auto { state: String },
+}
+
+#[derive(Subcommand)]
+enum AutostartCmd {
+    /// Install and start the user service.
+    Enable,
+    Disable,
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -175,6 +253,11 @@ enum SetupCmd {
 }
 
 fn main() -> Result<()> {
+    // Behave like other command line tools when piped into `head` and friends.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     match Cli::parse().cmd {
         Cmd::Info(src) => info(&src),
         Cmd::Response { src, channel, rate, points } => response(&src, &channel, rate, points),
@@ -215,6 +298,11 @@ fn main() -> Result<()> {
         Cmd::Install { src, pw, no_restart } => install(&src, &pw, no_restart),
         Cmd::Uninstall { no_restart } => uninstall(no_restart),
         Cmd::Live(l) => live(l),
+        Cmd::Profile(c) => profile(c),
+        Cmd::Bindings(c) => bindings(c),
+        Cmd::Device => device(),
+        Cmd::Watch { interval } => watch(interval),
+        Cmd::Autostart(c) => autostart(c),
     }
 }
 
@@ -402,7 +490,9 @@ fn pw_options(pw: &PwOpts) -> Options {
 
 fn install(src: &Source, pw: &PwOpts, no_restart: bool) -> Result<()> {
     let setup = load(src)?;
-    let warnings = linapo_pw::install(&setup, &pw_options(pw), !no_restart)?;
+    // Size the graph for every stored profile, so switching between them stays live.
+    let store = linapo_core::profiles::ProfileStore::new(linapo_pw::config_root()?.join("profiles"));
+    let warnings = linapo_pw::install_sized(&setup, &pw_options(pw), &store, !no_restart)?;
     warnings.iter().for_each(|w| eprintln!("warning: {w}"));
     println!("wrote {}", linapo_pw::conf_path()?.display());
     if no_restart {
@@ -440,11 +530,12 @@ fn live(cmd: LiveCmd) -> Result<()> {
                 match linapo_pw::structure_matches(&setup, &opts)? {
                     None => bail!("not installed; run `linapo install` first"),
                     Some(false) => bail!(
-                        "the structure changed (channels, number or type of filters, name or target), \
-                         so a restart is needed: run `linapo install`"
+                        "the structure changed (channel layout, output device, or more filters than the installed \
+                         graph has slots for), so a restart is needed: run `linapo install`"
                     ),
                     Some(true) => {}
                 }
+                let opts = Options { slots: linapo_pw::installed_slot_count(), ..opts };
                 for (k, v) in live_controls(&setup, &opts).map_err(anyhow::Error::msg)? {
                     println!("{k} = {v:?}");
                 }
@@ -457,8 +548,8 @@ fn live(cmd: LiveCmd) -> Result<()> {
                 }
                 linapo_pw::Applied::NotInstalled => bail!("not installed; run `linapo install` first"),
                 linapo_pw::Applied::NeedsRestart => bail!(
-                    "the structure changed (channels, number or type of filters, name or target), \
-                     so a restart is needed: run `linapo install`"
+                    "the structure changed (channel layout, output device, or more filters than the installed \
+                     graph has slots for), so a restart is needed: run `linapo install`"
                 ),
             }
         }
@@ -508,4 +599,198 @@ fn live(cmd: LiveCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// ------------------------------------------------------------------ profiles
+
+fn workspace() -> Result<Workspace> {
+    Workspace::open(&linapo_pw::config_root()?).context("opening the profile store")
+}
+
+fn profile(cmd: ProfileCmd) -> Result<()> {
+    let mut ws = workspace()?;
+    match cmd {
+        ProfileCmd::List => {
+            let active = ws.active_name().to_string();
+            for n in ws.store.list()? {
+                println!("{} {n}", if n == active { "*" } else { " " });
+            }
+        }
+        ProfileCmd::Active => println!("{}", ws.active_name()),
+        ProfileCmd::Path { name } => println!("{}", ws.store.path_of(&name).display()),
+        ProfileCmd::New { name, layout } => {
+            let name = linapo_core::profiles::valid_name(&name).map_err(anyhow::Error::msg)?;
+            if ws.store.exists(&name) {
+                bail!("a profile named '{name}' already exists");
+            }
+            ws.store.save(&name, &Setup::passthrough(&parse_layout(&layout)?))?;
+            println!("created profile '{name}'");
+        }
+        ProfileCmd::Save { name, src } => {
+            let setup = load(&src)?;
+            ws.store.save(&name, &setup)?;
+            println!("saved profile '{name}'");
+        }
+        ProfileCmd::Use { name, install } => {
+            let opts = Options::default();
+            match linapo_pw::apply_profile(&mut ws, &name, &opts, install) {
+                Ok(linapo_pw::ProfileSwitch::Live) => println!("switched to '{name}' (live)"),
+                Ok(linapo_pw::ProfileSwitch::Reinstalled) => println!("switched to '{name}' (reinstalled, PipeWire restarted)"),
+                Ok(linapo_pw::ProfileSwitch::NotInstalled) => {
+                    println!("'{name}' is now the active profile, but LinAPO is not installed in PipeWire yet: run `linapo install`")
+                }
+                Ok(linapo_pw::ProfileSwitch::NeedsRestart) => {
+                    bail!("'{name}' needs a restart (more filter slots or other channels than installed): run again with --install")
+                }
+                Err(e) => bail!("'{name}' is now the active profile, but applying it failed: {e:#}"),
+            }
+        }
+        ProfileCmd::Copy { from, to } => {
+            ws.store.duplicate(&from, &to).map_err(anyhow::Error::msg)?;
+            println!("copied '{from}' to '{to}'");
+        }
+        ProfileCmd::Rename { from, to } => {
+            ws.rename(&from, &to).map_err(anyhow::Error::msg)?;
+            println!("renamed '{from}' to '{to}'");
+        }
+        ProfileCmd::Delete { name } => {
+            let now = ws.delete(&name).map_err(anyhow::Error::msg)?;
+            println!("deleted '{name}'; active profile is '{now}'");
+        }
+    }
+    Ok(())
+}
+
+fn bindings(cmd: BindingsCmd) -> Result<()> {
+    let mut ws = workspace()?;
+    match cmd {
+        BindingsCmd::List => {
+            println!("automatic switching: {}", if ws.state.auto_switch { "on" } else { "off" });
+            println!("default profile:     {}", ws.state.default_profile.as_deref().unwrap_or("(leave the profile alone)"));
+            if ws.state.bindings.is_empty() {
+                println!("no devices are bound to profiles");
+            }
+            for (device, profile) in &ws.state.bindings {
+                println!("{device} -> {profile}");
+            }
+            if let Ok(Some(d)) = linapo_pw::current_output(&Options::default()) {
+                println!("\noutput device now: {} ({})", d.node_name, d.description);
+            }
+        }
+        BindingsCmd::Set { device, profile } => {
+            ws.bind(&device, &profile).map_err(anyhow::Error::msg)?;
+            println!("{device} -> {profile}");
+        }
+        BindingsCmd::Here { profile } => {
+            let d = linapo_pw::current_output(&Options::default())?.context("LinAPO is not playing to any device right now")?;
+            ws.bind(&d.node_name, &profile).map_err(anyhow::Error::msg)?;
+            println!("{} ({}) -> {profile}", d.node_name, d.description);
+        }
+        BindingsCmd::Remove { device } => {
+            if ws.unbind(&device).map_err(anyhow::Error::msg)? {
+                println!("removed the binding for {device}");
+            } else {
+                println!("{device} had no binding");
+            }
+        }
+        BindingsCmd::Default { profile } => {
+            let p = (!profile.eq_ignore_ascii_case("none")).then_some(profile.as_str());
+            ws.set_default_profile(p).map_err(anyhow::Error::msg)?;
+            println!("default profile: {}", p.unwrap_or("(none)"));
+        }
+        BindingsCmd::Auto { state } => {
+            let on = match state.to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" => true,
+                "off" | "false" | "no" => false,
+                other => bail!("expected 'on' or 'off', got '{other}'"),
+            };
+            ws.set_auto_switch(on).map_err(anyhow::Error::msg)?;
+            println!("automatic switching is {}", if on { "on" } else { "off" });
+        }
+    }
+    Ok(())
+}
+
+fn device() -> Result<()> {
+    match linapo_pw::current_output(&Options::default())? {
+        Some(d) => println!("{} ({})", d.node_name, d.description),
+        None => bail!("LinAPO is not playing to any device right now (is it installed and running?)"),
+    }
+    Ok(())
+}
+
+fn watch(interval: f64) -> Result<()> {
+    if !(interval >= 0.1) {
+        bail!("--interval must be at least 0.1 seconds");
+    }
+    // Only one process switches profiles. If a GUI window holds the lock, wait for it to close
+    // (so a systemd service started at login does not fail and restart in a loop).
+    let _lock = loop {
+        if let Some(l) = linapo_pw::WatchLock::try_acquire() {
+            break l;
+        }
+        eprintln!("another linapo watcher (a GUI window, probably) is switching profiles; waiting for it to finish");
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    };
+    let mut w = linapo_pw::Watcher::new(workspace()?, Options::default());
+    eprintln!("watching the output device (every {interval} s); Ctrl+C to stop");
+    let mut last_error = String::new();
+    loop {
+        match w.tick() {
+            Ok(Some(note)) => println!("{note}"),
+            Ok(None) => last_error.clear(),
+            Err(e) => {
+                // Report a given problem once instead of every second.
+                let msg = format!("{e:#}");
+                if msg != last_error {
+                    eprintln!("warning: {msg}");
+                    last_error = msg;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs_f64(interval));
+    }
+}
+
+fn autostart(cmd: AutostartCmd) -> Result<()> {
+    let unit_path = linapo_pw::systemd_unit_path()?;
+    let systemctl = |args: &[&str]| -> Result<()> {
+        let st = std::process::Command::new("systemctl").arg("--user").args(args).status().context("running systemctl")?;
+        if !st.success() {
+            bail!("systemctl --user {} failed ({st})", args.join(" "));
+        }
+        Ok(())
+    };
+    match cmd {
+        AutostartCmd::Enable => {
+            let exe = std::env::current_exe().context("finding this program")?;
+            if let Some(dir) = unit_path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&unit_path, linapo_pw::systemd_unit(&exe))?;
+            println!("wrote {}", unit_path.display());
+            systemctl(&["daemon-reload"])?;
+            systemctl(&["enable", "--now", "linapo-watch.service"])?;
+            println!("enabled: `linapo watch` now starts at login");
+        }
+        AutostartCmd::Disable => {
+            let _ = systemctl(&["disable", "--now", "linapo-watch.service"]);
+            if unit_path.exists() {
+                std::fs::remove_file(&unit_path)?;
+                let _ = systemctl(&["daemon-reload"]);
+                println!("removed {}", unit_path.display());
+            } else {
+                println!("it was not enabled");
+            }
+        }
+        AutostartCmd::Status => {
+            println!("unit file: {} ({})", unit_path.display(), if unit_path.exists() { "present" } else { "absent" });
+            let active = std::process::Command::new("systemctl").args(["--user", "is-active", "linapo-watch.service"]).output();
+            match active {
+                Ok(o) => println!("service: {}", String::from_utf8_lossy(&o.stdout).trim()),
+                Err(_) => println!("service: systemctl is not available"),
+            }
+        }
+    }
+    Ok(())
 }

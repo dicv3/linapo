@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 pub use linapo_pw::{Applied, Sink, Status};
 
 use linapo_core::pipewire_conf::Options;
+use linapo_core::profiles::ProfileStore;
 use linapo_core::Setup;
 
 pub trait Backend: Send + 'static {
@@ -19,16 +20,20 @@ pub trait Backend: Send + 'static {
     fn install(&mut self, setup: &Setup) -> Result<Vec<String>, String>;
     fn uninstall(&mut self) -> Result<bool, String>;
     fn list_sinks(&mut self) -> Result<Vec<Sink>, String>;
+    /// The real device LinAPO is playing to right now.
+    fn current_output(&mut self) -> Result<Option<Sink>, String>;
 }
 
 /// The real thing: shells out through `linapo-pw`.
 pub struct PwBackend {
     pub opts: Options,
+    /// When set, installing sizes the graph for every stored profile, so switching stays live.
+    pub store: Option<ProfileStore>,
 }
 
 impl Default for PwBackend {
     fn default() -> Self {
-        PwBackend { opts: Options::default() }
+        PwBackend { opts: Options::default(), store: None }
     }
 }
 
@@ -44,13 +49,19 @@ impl Backend for PwBackend {
         linapo_pw::apply_live(setup, &self.opts).map_err(e)
     }
     fn install(&mut self, setup: &Setup) -> Result<Vec<String>, String> {
-        linapo_pw::install(setup, &self.opts, true).map_err(e)
+        match &self.store {
+            Some(store) => linapo_pw::install_sized(setup, &self.opts, store, true).map_err(e),
+            None => linapo_pw::install(setup, &self.opts, true).map_err(e),
+        }
     }
     fn uninstall(&mut self) -> Result<bool, String> {
         linapo_pw::uninstall(true).map_err(e)
     }
     fn list_sinks(&mut self) -> Result<Vec<Sink>, String> {
         linapo_pw::list_sinks().map_err(e)
+    }
+    fn current_output(&mut self) -> Result<Option<Sink>, String> {
+        linapo_pw::current_output(&self.opts).map_err(e)
     }
 }
 
@@ -64,6 +75,8 @@ pub enum Job {
     Install(Setup),
     Uninstall,
     ListSinks,
+    /// Ask which real device LinAPO is playing to.
+    PollDevice,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +85,8 @@ pub enum Event {
     Message(String),
     Error(String),
     Sinks(Vec<Sink>),
+    /// The device LinAPO is playing to (`None`: unknown or not running).
+    Device(Option<Sink>),
     /// A slow job (restart) started / finished.
     Busy(bool),
 }
@@ -189,6 +204,7 @@ fn run_job(b: &mut impl Backend, job: Job, send: &impl Fn(Event)) {
             // Not an error worth shouting about: usually PipeWire is simply not running.
             Err(m) => send(Event::Message(format!("Could not list output devices: {m}"))),
         },
+        Job::PollDevice => send(Event::Device(b.current_output().ok().flatten())),
     }
 }
 
@@ -205,6 +221,8 @@ pub mod fake {
         pub status_result: Arc<Mutex<Result<Status, String>>>,
         /// If set, `apply` waits for a message on this channel before answering.
         pub gate: Arc<Mutex<Option<Receiver<()>>>>,
+        /// What `current_output` answers.
+        pub device: Arc<Mutex<Option<Sink>>>,
     }
 
     impl Fake {
@@ -214,6 +232,7 @@ pub mod fake {
                 apply_result: Arc::new(Mutex::new(Ok(Applied::Live { values: 1 }))),
                 status_result: Arc::new(Mutex::new(Ok(Status::Live))),
                 gate: Default::default(),
+                device: Default::default(),
             }
         }
         pub fn calls(&self) -> Vec<String> {
@@ -240,6 +259,9 @@ pub mod fake {
         fn uninstall(&mut self) -> Result<bool, String> {
             self.calls.lock().unwrap().push("uninstall".into());
             Ok(true)
+        }
+        fn current_output(&mut self) -> Result<Option<Sink>, String> {
+            Ok(self.device.lock().unwrap().clone())
         }
         fn list_sinks(&mut self) -> Result<Vec<Sink>, String> {
             self.calls.lock().unwrap().push("list_sinks".into());
@@ -365,6 +387,17 @@ mod tests {
         w.send(Job::ListSinks);
         let ev = wait_for(&w, |e| matches!(e, Event::Sinks(_)));
         assert!(ev.iter().any(|e| matches!(e, Event::Sinks(s) if s[0].node_name == "dev")));
+    }
+
+    #[test]
+    fn polling_reports_the_current_device() {
+        let fake = Fake::new();
+        let w = Worker::spawn(fake.clone(), || {});
+        w.send(Job::PollDevice);
+        wait_for(&w, |e| *e == Event::Device(None));
+        *fake.device.lock().unwrap() = Some(Sink { node_name: "usb".into(), description: "USB DAC".into() });
+        w.send(Job::PollDevice);
+        wait_for(&w, |e| matches!(e, Event::Device(Some(d)) if d.node_name == "usb"));
     }
 
     #[test]

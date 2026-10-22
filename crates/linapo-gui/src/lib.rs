@@ -9,4 +9,4 @@ pub mod plot_math;
 #[cfg(test)]
 mod ui_tests;
 
-pub use app::{App, Config, EframeApp, Tab};
+pub use app::{App, Config, EframeApp, ProfileDialog, Tab};

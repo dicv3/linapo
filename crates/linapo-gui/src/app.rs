@@ -15,6 +15,11 @@ use linapo_core::matrix::lin_to_db;
 use linapo_core::Setup;
 
 use crate::backend::{Backend, Event, Job, Sink, Status, Worker};
+use linapo_core::profiles::{valid_name, Workspace};
+use linapo_pw::WatchLock;
+
+mod profile_bar;
+pub use profile_bar::ProfileDialog;
 use crate::model::{self, KINDS};
 use crate::picker::{with_json_extension, FilePicker, NativePicker, Purpose};
 use crate::plot_math as pm;
@@ -39,6 +44,13 @@ pub struct Config {
     pub debounce_save: Duration,
     /// Edits closer together than this form one undo step (so a whole drag is a single step).
     pub history_gap: Duration,
+    /// How often the output device is checked (profile bar, automatic switching).
+    pub poll_interval: Duration,
+    /// Wake the UI every `poll_interval` even when nothing happens, so the device is re-read while
+    /// the window is idle. (Tests switch this off: their harness treats it as a never-ending repaint.)
+    pub repaint_while_idle: bool,
+    /// Where the automatic-switching lock lives (`None`: the standard place; tests use their own).
+    pub watch_lock_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -47,6 +59,9 @@ impl Default for Config {
             debounce_apply: Duration::from_millis(60),
             debounce_save: Duration::from_millis(600),
             history_gap: Duration::from_millis(400),
+            poll_interval: Duration::from_millis(500),
+            repaint_while_idle: true,
+            watch_lock_path: None,
         }
     }
 }
@@ -92,6 +107,16 @@ pub struct App {
     /// A file dialog is open (they are modal, so a second one must not start).
     pub dialog_open: bool,
     last_dir: Option<PathBuf>,
+    workspace: Option<Workspace>,
+    profiles: Vec<String>,
+    loaded_profile: String,
+    pub current_device: Option<Sink>,
+    watch_lock: Option<WatchLock>,
+    /// Automatic switching is on but another process holds the lock.
+    pub watch_elsewhere: bool,
+    last_device: Option<String>,
+    next_poll: Instant,
+    pub profile_dialog: Option<ProfileDialog>,
 }
 
 const MAX_HISTORY: usize = 200;
@@ -143,6 +168,15 @@ impl App {
             dialog_rx,
             dialog_open: false,
             last_dir: None,
+            workspace: None,
+            profiles: Vec::new(),
+            loaded_profile: String::new(),
+            current_device: None,
+            watch_lock: None,
+            watch_elsewhere: false,
+            last_device: None,
+            next_poll: Instant::now(),
+            profile_dialog: None,
         }
     }
 
@@ -238,6 +272,7 @@ impl App {
                 Event::Message(m) => self.say(m, false),
                 Event::Error(m) => self.say(m, true),
                 Event::Sinks(s) => self.sinks = s,
+                Event::Device(d) => self.on_device(d),
                 Event::Busy(b) => self.busy = b,
             }
         }
@@ -335,11 +370,19 @@ impl App {
                 }
                 Purpose::SaveSetup => {
                     let path = with_json_extension(path);
-                    self.file_field = path.display().to_string();
-                    self.path = Some(path.clone());
-                    self.save_now();
-                    if self.saved {
-                        self.say(format!("Saved {}", path.display()), false);
+                    if self.workspace.is_some() {
+                        // Profiles live in the store; a copy elsewhere does not change what is edited.
+                        match self.setup.save(&path) {
+                            Ok(()) => self.say(format!("Saved a copy to {}", path.display()), false),
+                            Err(e) => self.say(format!("Could not save {}: {e}", path.display()), true),
+                        }
+                    } else {
+                        self.file_field = path.display().to_string();
+                        self.path = Some(path.clone());
+                        self.save_now();
+                        if self.saved {
+                            self.say(format!("Saved {}", path.display()), false);
+                        }
                     }
                 }
             }
@@ -364,7 +407,9 @@ impl App {
         match Setup::load(path) {
             Ok(s) => {
                 self.setup = s;
-                self.path = Some(path.to_path_buf());
+                if self.workspace.is_none() {
+                    self.path = Some(path.to_path_buf());
+                }
                 self.selected_eq = 0;
                 self.selected_filter = None;
                 self.monitor = 0;
@@ -431,6 +476,7 @@ impl App {
     pub fn ui(&mut self, ctx: &egui::Context) {
         self.poll_worker();
         self.poll_dialogs();
+        self.poll_device_if_due(ctx);
         self.handle_drops(ctx);
         if self.tab == Tab::Equalizer && !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             self.delete_selected_filter();
@@ -449,6 +495,9 @@ impl App {
         self.monitor = self.monitor.min(self.setup.output_channels.len().saturating_sub(1));
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_bar(ui));
+        if self.has_workspace() {
+            egui::TopBottomPanel::top("profiles").show(ctx, |ui| self.profile_bar(ui));
+        }
         egui::TopBottomPanel::top("banner").show_separator_line(false).show(ctx, |ui| self.banner(ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
@@ -456,6 +505,7 @@ impl App {
             Tab::Equalizer => self.eq_tab(ui),
             Tab::Setup => self.setup_tab(ui),
         });
+        self.profile_dialog_window(ctx);
         self.flush(ctx);
     }
 
@@ -998,6 +1048,7 @@ impl App {
     fn setup_tab(&mut self, ui: &mut Ui) {
         ui.add_space(8.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
+            self.profiles_section(ui);
             ui.label(RichText::new("Channels").heading());
             ui.add_space(4.0);
             let mut changed = false;

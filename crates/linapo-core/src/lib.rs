@@ -11,6 +11,7 @@ pub mod graphic_eq;
 pub mod handoff;
 pub mod matrix;
 pub mod pipewire_conf;
+pub mod profiles;
 pub mod setup;
 
 pub use apo::{layout_for, parse_file, parse_str, Channel, Profile};

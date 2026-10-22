@@ -12,6 +12,7 @@ setups with:
 - Stereo, quad, 5.1, 7.1, and custom channel layouts
 - Import of Equalizer APO profiles, including `Copy:`, `Channel:`, and `GraphicEQ:`
 - Live changes without restarting PipeWire when the graph structure is unchanged
+- Named profiles with per-device bindings and automatic switching
 - Offline WAV rendering and frequency-response inspection
 
 ```text
@@ -40,6 +41,25 @@ instance. The PipeWire integration uses the command-line tools `pw-dump`, `pw-cl
 and `systemctl`; no native PipeWire development library is required.
 
 ## Install
+
+### Download a release
+
+Pre-built release binaries can be downloaded from the
+[GitHub Releases](https://github.com/dicv3/linapo/releases) page. Download the
+archive for your system, extract it, and run `linapo` or `linapo-gui` directly.
+No Rust toolchain is required for a release binary. For example:
+
+```sh
+tar -xf linapo-*.tar.gz
+cd linapo-*/
+./linapo-gui
+```
+
+The release binaries are self-contained LinAPO executables, but live audio still
+requires PipeWire, WirePlumber, and the command-line tools listed in
+[Requirements](#requirements).
+
+### Build from source
 
 Clone the repository and build the release binaries:
 
@@ -111,6 +131,11 @@ linapo-gui setup.json
 The default setup is saved at `~/.config/linapo/setup.json`. Edits are saved
 automatically and pushed to PipeWire after a short debounce period.
 
+Named profiles are stored in `~/.config/linapo/profiles/`. Profiles can be
+selected and edited live, and can be associated with specific output devices.
+Enable automatic switching to apply the matching profile when the active output
+device changes.
+
 ### Matrix
 
 The matrix editor controls the linear gain from every input channel to every output
@@ -133,7 +158,8 @@ replacement. Undo and redo cover edits, imports, and layout changes.
 
 Structural changes such as channel layouts, output devices, and filter types require
 an install or PipeWire restart. Numeric changes, filter enable state, and EQ bypass
-are live.
+are live. Switching between profiles is also live when the installed graph has
+enough filter slots for the selected profile.
 
 ## CLI commands
 
@@ -150,6 +176,14 @@ linapo live apply <setup.json>
 linapo live master <setup.json> <db>
 linapo live route <setup.json> <input> <output> <db|off>
 linapo live bypass <setup.json> <on|off>
+linapo profile new <name>
+linapo profile save <name> <setup-or-apo-file>
+linapo profile use <name>
+linapo bindings set <pipewire-node-name> <profile>
+linapo bindings default <profile>
+linapo bindings auto <on|off>
+linapo watch
+linapo autostart <enable|status|disable>
 ```
 
 Commands that accept a setup also accept an Equalizer APO profile. Use `--layout`
@@ -157,6 +191,10 @@ when loading an APO profile; JSON setup files contain their own layouts.
 
 `process` renders a 32-bit float WAV through the reference engine, including the
 matrix, EQ, master gain, and limiter. `response` prints CSV frequency-response data.
+`profile use` switches the active profile without restarting PipeWire when the
+graph structure is unchanged. `watch` monitors the current output device and
+switches profiles according to the configured bindings. `autostart` manages a
+systemd user service that runs `watch` at login.
 
 ## Setup files
 
@@ -212,11 +250,37 @@ features.
 Unsupported APO features such as `Device:`, `Delay:`, `Convolution:`, conditional
 blocks, VST, and LADSPA lines are reported as warnings and skipped.
 
+## Profiles and device switching
+
+Profiles are setup files stored under `~/.config/linapo/profiles/`. Use the CLI
+or GUI to create, duplicate, rename, delete, and switch profiles. A profile can
+be bound to a specific PipeWire output device, while a default profile can be
+used for all other devices.
+
+Enable automatic switching with:
+
+```sh
+linapo bindings set <pipewire-node-name> <profile>
+linapo bindings default <profile>
+linapo bindings auto on
+linapo watch
+```
+
+`linapo watch` checks for output-device changes and applies the matching profile
+without rebuilding the graph when possible. To start it automatically at login:
+
+```sh
+linapo autostart enable
+```
+
+Use `linapo autostart status` or `linapo autostart disable` to inspect or remove
+the systemd user service.
+
 ## Architecture
 
 ```text
 linapo-core  DSP, biquads, APO parser, setup model, engine, PipeWire config generation
-linapo-pw    PipeWire discovery, installation, status, and live control updates
+linapo-pw    PipeWire discovery, installation, status, profiles, and live control updates
 linapo-cli   Command-line interface and offline processing commands
 linapo-gui   egui/eframe editor and background PipeWire worker
 ```
@@ -256,6 +320,8 @@ The parity test additionally needs PipeWire, WirePlumber, `pw-cat`, `pw-cli`,
   can produce different results from Equalizer APO.
 - PipeWire gain changes currently jump instead of using the reference engine's smooth
   ramps.
+- Automatic device switching may take up to about one second after the output device
+  changes.
 - Arbitrary channel lists work in JSON setup files but the GUI layout picker offers
   mono, stereo, quad, 5.1, and 7.1.
 

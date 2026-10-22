@@ -29,13 +29,6 @@ pub enum FilterKind {
 }
 
 impl FilterKind {
-    /// Kinds PipeWire's native `bq_*` nodes implement exactly like the RBJ cookbook, with a
-    /// gain control that makes them neutral at 0 dB. All other kinds are sent as `bq_raw`
-    /// with coefficients computed here.
-    pub fn native_in_pipewire(self) -> bool {
-        matches!(self, FilterKind::Peaking | FilterKind::LowShelf | FilterKind::HighShelf)
-    }
-
     pub fn short_name(self) -> &'static str {
         match self {
             FilterKind::Peaking => "PK",

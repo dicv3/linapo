@@ -17,7 +17,7 @@ inputs ──► matrix (N×M gains) ──► EQ per output channel ──► m
 ## Quick start
 
 ```sh
-cargo test --workspace                                  # 188 tests, no PipeWire needed
+cargo test --workspace                                  # 227 tests, no PipeWire needed
 cargo build --release                                   # target/release/linapo  and  linapo-gui
 
 linapo-gui                                              # the graphical editor (see below)
@@ -26,6 +26,11 @@ linapo setup import examples/sample.txt -o my.json      # APO profile -> setup f
 linapo info my.json                                     # matrix, EQs, channels
 linapo install my.json                                  # virtual sink + restart PipeWire
 linapo live master my.json -6                           # change master gain, no restart
+linapo profile new Headphones && linapo profile save Room my.json   # named profiles
+linapo profile use Headphones                           # switch live (no restart)
+linapo bindings set alsa_output.usb-DAC Headphones      # this device -> this profile
+linapo bindings auto on && linapo watch                 # follow the output device
+linapo autostart enable                                 # ...and do that at every login
 linapo live route my.json L SUB -3                      # change one matrix cell, no restart
 linapo live apply my.json                               # push every value of an edited my.json
 linapo uninstall
@@ -81,9 +86,18 @@ open native file dialogs that remember the last folder; dropping a file on the w
 is undoable, including imports and layout changes), *Bypass EQ* for A/B comparison with the
 original sound, and the master gain. Each filter has an *On* checkbox; disabled filters are
 grey dots on the plot and drop out of the curve. A status pill (top right) shows whether the audio engine is **Live**, **Not installed**, **Not
-running** or needs a **restart**. Changing channels, the output device, or the number/type of
-filters is structural: a banner offers "Apply and restart audio" (which restarts PipeWire and
-briefly interrupts sound). Everything else is live.
+running** or needs a **restart**. Only a different channel layout, a different output device, or a
+profile needing more filter slots than are installed is structural: a banner then offers "Apply
+and restart audio" (which restarts PipeWire and briefly interrupts sound). Everything else, including
+switching to a completely different profile, is live.
+
+**Profiles**: the bar under the tabs holds the profile selector with *New / Duplicate / Rename /
+Delete profile* and shows the output device in use and its profile. Every profile is a setup file in
+`~/.config/linapo/profiles/`; edits are saved into the active profile, and undo history starts fresh
+per profile. The *Setup* tab has the bindings editor: bind the current device to the active
+profile, a profile for all other devices, and a switch for automatic switching.
+
+![profiles](docs/profiles.png)
 
 Built with egui/eframe: pure Rust, no GTK or Qt needed. PipeWire work runs on a background
 thread, so the window never blocks, and bursts of edits are coalesced.
@@ -144,19 +158,34 @@ interpolation APO documents (linear in dB against log frequency, flat beyond the
 ![graphic eq](docs/graphic-eq.png)
 Files may be UTF-8 (BOM ok) or UTF-16; bad lines become warnings.
 
-## Live editing
+## Live editing and profiles
 
-Everything numeric changes instantly while audio plays: matrix cells, preamps, master gain, and
-the frequency / Q / gain of **every** filter type, plus switching a single filter or the whole EQ
-on and off (`linapo live apply`, `master`, `route`, `bypass on|off`; the GUI does this for every
-edit). Only the *structure* needs `linapo install`: channel layout, output device, and the number
-or type of filters. `live apply` tells you when that is the case.
+Everything numeric changes instantly while audio plays: matrix cells, preamps, master gain, every
+filter, switching single filters or the whole EQ on and off, and **switching to a different
+profile** (`linapo live apply`, `master`, `route`, `bypass on|off`, `profile use`; the GUI does this
+for every edit). `linapo live apply` tells you when a change is structural.
 
-Under the hood, peaking and shelf filters use PipeWire's native nodes; every other kind is a
-`bq_raw` node whose coefficients are computed here and pushed at the graph's running sample rate
-(read from PipeWire's `settings` metadata). A disabled filter stays in the graph with neutral
-values, which is why toggling never needs a restart. After each live edit the installed config
-file is refreshed too, so a PipeWire restart starts from your current values.
+How that works: the graph's *structure* depends only on the channel layout, the output device and
+a number of **filter slots** per output channel (at least 16, in steps of 8, sized at install time for
+the largest stored profile). Every slot is a `bq_raw` biquad whose coefficients are computed here
+(so every filter type matches the engine exactly) and pushed for the sample rate PipeWire is
+running at. Unused slots, disabled filters and EQ bypass hold neutral coefficients. A profile with
+different filter types, counts or channel assignments therefore changes only values. Only a
+different layout/device, or a profile that needs more slots than installed, restarts PipeWire
+(`profile use --install`). After each live edit the installed config file is refreshed too, so a
+PipeWire restart starts from your current values. A long-running process (the GUI, `linapo watch`)
+sends only the values that changed.
+
+## Per-device profiles and auto-start
+
+`linapo bindings set <pipewire-node-name> <profile>` (or the GUI) ties a profile to an output
+device; `linapo bindings default <profile>` covers the others; `linapo bindings auto on` enables
+switching. LinAPO finds the real device by following the link out of its own sink, so it works even
+when LinAPO is your system's default output. `linapo watch` polls every 0.5 s and switches when
+the device changes (about half a second later the new profile is audible). Only one process switches at a time (a lock), either the GUI window or the
+background service; the other follows the shared `state.json`. `linapo autostart enable` installs a
+systemd *user* unit running `linapo watch` at login (`status` / `disable` too). The engine itself
+needs no start-up help: the installed config is loaded by PipeWire at boot.
 
 ## How it works, and what I verified
 
@@ -182,15 +211,26 @@ I ran everything against a real **PipeWire 1.0.5 + WirePlumber** (headless, null
 Things testing turned up, now handled:
 
 * PipeWire 1.0.5's native `bq_lowpass`/`bq_highpass` do not treat Q like the RBJ cookbook
-  (requested 0.7071 behaved like 0.90). They (and band-pass, notch, all-pass, 6 dB shelves) are
-  emitted as `bq_raw` with exact coefficients instead: per sample rate in the config, and as live
-  controls for the running rate. Verified by editing their parameters, disabling filters and
-  switching bypass on during playback: output matched the engine to within 0.03 dB.
+  (requested 0.7071 behaved like 0.90), so every filter is a `bq_raw` with exact coefficients.
+  Verified on a real PipeWire: all 10 filter types, a 31-filter GraphicEQ bank, live edits,
+  disabling filters, bypass, and switching between three structurally different profiles during
+  playback all matched the engine to within 0.03 dB.
+* A biquad whose six coefficients arrive in two separate updates briefly runs half-old, half-new and
+  can ring (a 6x overshoot showed up while switching profiles). Updates are now batched per node, so
+  a filter's coefficients always change together.
+* Destroying and reloading just LinAPO's module (instead of restarting PipeWire) takes 75 ms but
+  moves every app off the new sink, so they play *without* the EQ until they reconnect. That is why
+  profiles switch by values in a fixed graph rather than by reloading it.
+* A desktop `WirePlumber` treats a recorder that targets "the current default sink" as following
+  the default; my first per-device test recorded the wrong device until I used unmanaged recorders.
 * `pw-cli set-param` silently drops a batch larger than ~1 KB, so `live` sends small chunks and
   checks that PipeWire echoed every key.
 
 ## Limitations
 
+* Switching takes up to ~1 s after the device changes (poll interval plus the first full value
+  push), during which the old profile is still audible. Everything is tested on PipeWire 1.0.5 and
+  WirePlumber 0.4.17 only.
 * Tested on PipeWire 1.0.5 only. Newer versions should behave the same; if not, run
   `tests/pipewire/parity.py`.
 * The **limiter** exists only in the reference engine; the PipeWire backend ignores it (with a
@@ -215,7 +255,7 @@ Things testing turned up, now handled:
 ## Layout
 
 ```
-crates/linapo-core/   biquad.rs filter.rs apo.rs matrix.rs setup.rs chain.rs engine.rs handoff.rs pipewire_conf.rs
+crates/linapo-core/   biquad.rs filter.rs apo.rs matrix.rs setup.rs chain.rs engine.rs handoff.rs pipewire_conf.rs profiles.rs
 crates/linapo-pw/     PipeWire plumbing shared by CLI and GUI: install, live apply, status, device list
 crates/linapo-cli/    the `linapo` binary + tests/cli.rs
 crates/linapo-gui/    the egui app: model.rs (edit logic), plot_math.rs, backend.rs (worker), app.rs (UI), ui_tests.rs
